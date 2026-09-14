@@ -1,0 +1,44 @@
+{
+  "replays": [
+    {
+      "file": "guns_perch.json",
+      "tag": "perch",
+      "result": "blue",
+      "duration_s": 58.6,
+      "blue": "guns",
+      "red": "level",
+      "frames": 118,
+      "manoeuvres": 0.487
+    },
+    {
+      "file": "neutral_mirror.json",
+      "tag": "mirror",
+      "result": "draw",
+      "duration_s": 60.0,
+      "blue": "guns",
+      "red": "jinker",
+      "frames": 121,
+      "manoeuvres": 0.133
+    },
+    {
+      "file": "poly_perch.json",
+      "tag": "perch",
+      "result": "red",
+      "duration_s": 53.4,
+      "blue": "poly",
+      "red": "level",
+      "frames": 107,
+      "manoeuvres": 0.443
+    },
+    {
+      "file": "random_start.json",
+      "tag": "random",
+      "result": "red",
+      "duration_s": 45.0,
+      "blue": "guns",
+      "red": "jinker",
+      "frames": 91,
+      "manoeuvres": 0.467
+    }
+  ]
+}
