@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fruit-fly-BFM — engagement viewer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot blue"></span>
+    <h1>fruit-fly-BFM</h1>
+    <span class="sub">guns-only BFM, flown by a connectome-constrained controller</span>
+  </div>
+  <div class="pickers">
+    <select id="replaySel" title="replay"></select>
+    <button id="reload" class="ghost" title="reload manifest">↻</button>
+  </div>
+</header>
+
+<main>
+  <section class="stage">
+    <canvas id="view"></canvas>
+    <div id="hud" class="hud"></div>
+    <div class="stagebar">
+      <button id="play">⏸</button>
+      <input type="range" id="scrub" min="0" max="1000" value="0">
+      <span id="clock" class="mono">0.0s</span>
+      <span class="spacer"></span>
+      <label class="speed">speed
+        <select id="speed">
+          <option value="0.25">0.25×</option>
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+      <label class="speed">camera
+        <select id="cam">
+          <option value="chase-blue" selected>chase blue</option>
+          <option value="chase-red">chase red</option>
+          <option value="top">top down</option>
+          <option value="free">free</option>
+        </select>
+      </label>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <h2 id="scenTitle">no replay</h2>
+    <div id="scenDesc" class="desc"></div>
+
+    <div class="result" id="result"></div>
+
+    <h3>telemetry</h3>
+    <table id="telemetry" class="mono"></table>
+
+    <h3>brain / policy output</h3>
+    <div id="commands" class="cmds"></div>
+
+    <h3>manoeuvres</h3>
+    <div id="manoeuvres" class="small"></div>
+
+    <h3>events</h3>
+    <ol id="events" class="events mono"></ol>
+
+    <p class="foot">
+      Frames are recorded at <span id="rate" class="mono">—</span>. Drag on the view
+      to orbit, wheel to zoom, click the timeline to scrub.
+    </p>
+  </aside>
+</main>
+
+<footer>
+  <canvas id="strip"></canvas>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
