@@ -2,7 +2,7 @@
 
 Three policy families, deliberately comparable:
 
-  FeaturePolicy     linear (or 2-layer tanh) map from the 18 engineered
+  FeaturePolicy     linear (or 2-layer tanh) map from the 22 engineered
                     geometry features to the four command channels.  This is
                     the workhorse: fast enough to train by black-box search,
                     and a clean baseline for "how much of BFM is in the
@@ -29,9 +29,14 @@ from ..sim.aircraft import Command
 
 
 class FeaturePolicy:
-    """Linear policy over the engineered observation, with saturation."""
+    """Linear policy over the engineered observation, with saturation.
 
-    N_IN = 18
+    Gunnery-focused final (2026-09): N_IN 22 adds lead_az and lead_el separate
+    horizontal/vertical errors to ballistic lead point. Linear default 92 params.
+    Trigger bias positive to avoid never-fire local optimum.
+    """
+
+    N_IN = 22
     N_OUT = 4             # roll, pull, throttle, trigger logit
 
     def __init__(self, params: Optional[Sequence[float]] = None, hidden: int = 0,
@@ -44,6 +49,10 @@ class FeaturePolicy:
             self.n_params = (hidden * (self.N_IN + 1) + self.N_OUT * (hidden + 1))
         if params is None:
             params = [rng.gauss(0.0, 0.1) for _ in range(self.n_params)]
+            # trigger bias +1.5 to avoid never-fire local optimum (suggestion 4, was 0.8)
+            for o in range(self.N_OUT):
+                if o == 3:  # trigger
+                    params[o * (self.N_IN + 1) + self.N_IN] = 1.5
         self.params: List[float] = list(params)
 
     def copy(self):
@@ -102,8 +111,11 @@ class FeaturePolicy:
 # ones (nose, aspect, range, closure, LOS rate, speed, lead error) is small
 # enough that ridge regression can fit it from a few thousand demonstrated
 # samples, and therefore small enough for CEM to refine.
+#
+# Gunnery-focused final (2026-09): N_IN 22 adds lead_az/el separate (18,19,20,21)
+# for direction to ballistic lead point. Subset now includes 15 (lead mag) + 18-21.
 # --------------------------------------------------------------------------- #
-QUAD_SUBSET = (0, 1, 2, 4, 5, 6, 7, 8, 9, 15)
+QUAD_SUBSET = (0, 1, 2, 4, 5, 6, 7, 8, 9, 15, 18, 19, 20, 21)
 
 
 def quad_features(phi: Sequence[float], subset=QUAD_SUBSET) -> List[float]:
@@ -117,9 +129,14 @@ def quad_features(phi: Sequence[float], subset=QUAD_SUBSET) -> List[float]:
 
 
 class PolyPolicy:
-    """Linear readout on a quadratic expansion of the observation."""
+    """Linear readout on a quadratic expansion of the observation.
 
-    N_IN = 18
+    Gunnery-focused final (2026-09): N_IN 22, includes lead az/el direction separate.
+    22 + squares 14 + cross 91 = 127 features per output *4 = 508 params.
+    Linear is now default (92 params) — only switch to poly after linear hits.
+    """
+
+    N_IN = 22
     N_OUT = 4
 
     def __init__(self, params: Optional[Sequence[float]] = None, seed: int = 0,
@@ -130,6 +147,8 @@ class PolyPolicy:
         self.n_params = self.N_OUT * self.n_features
         if params is None:
             params = [rng.gauss(0.0, 0.05) for _ in range(self.n_params)]
+            # trigger bias +1.5 to avoid never-fire
+            params[3 * self.n_features] = 1.5
         self.params: List[float] = list(params)
 
     def copy(self):
