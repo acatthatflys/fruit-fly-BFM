@@ -73,6 +73,29 @@
   </aside>
 </main>
 
+<section class="extra">
+  <div class="extra-panel">
+    <h3>brain firing — who is spiking? <span class="dim" id="brainMeta"></span></h3>
+    <canvas id="brainView" width="420" height="240"></canvas>
+    <div id="brainLegend" class="small mono"></div>
+    <div class="small dim" style="margin-top:6px">
+      Groups: R1-R6 retina, STMD small-target, VPN visual projection, DN left/right steering, pitch up/down, speed, trigger. 
+      When full MaleCNS is loaded, per-type rates appear. Bars = Hz, color = L vs R. 
+      No brain field? Run <span class="mono">--blue brain</span> to record.
+    </div>
+  </div>
+  <div class="extra-panel">
+    <h3>fly stick & throttle — what the brain is doing <span class="dim" id="flyMeta"></span></h3>
+    <canvas id="flyView" width="420" height="240"></canvas>
+    <div id="flyStatus" class="small mono"></div>
+    <div class="small dim" style="margin-top:6px">
+      Stick X = roll (turn_gain * (R−L + vis_gain*STMD_R−L)), Y = pull (pitch_up−down). 
+      Throttle lever = throttle_bias + gain*speed. Trigger = DNp10/DNp03 rate > thresh.
+      Fly cartoon manipulates stick based on actual DN output.
+    </div>
+  </div>
+</section>
+
 <footer>
   <canvas id="strip"></canvas>
 </footer>

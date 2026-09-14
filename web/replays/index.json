@@ -1,6 +1,16 @@
 {
   "replays": [
     {
+      "file": "brain_perch.json",
+      "tag": "perch",
+      "result": "blue",
+      "duration_s": 10.02,
+      "blue": "brain",
+      "red": "level",
+      "frames": 21,
+      "manoeuvres": 0.05
+    },
+    {
       "file": "guns_perch.json",
       "tag": "perch",
       "result": "blue",

@@ -394,6 +394,71 @@ def _outside(s: State, cfg: EnvConfig):
     return None
 
 
+def _brain_snapshot_from_policy(policy):
+    """Return brain dict if policy is brain-backed, else None."""
+    try:
+        # BrainPolicyAdapter -> controller -> net
+        c = getattr(policy, 'c', None)
+        if c is None:
+            return None
+        net = getattr(c, 'net', None)
+        if net is None:
+            return None
+        # group rates via controller._groups()
+        groups = {}
+        try:
+            g = c._groups()
+            for k, idx in g.items():
+                try:
+                    groups[k] = float(net.group_rate(idx))
+                except Exception:
+                    groups[k] = 0.0
+        except Exception:
+            pass
+        # population rate and spikes
+        try:
+            pop = float(net.population_rate())
+        except Exception:
+            pop = 0.0
+        try:
+            spikes = len(getattr(net, 'spikes', []))
+        except Exception:
+            spikes = 0
+        # DN left/right diff for stick viz
+        try:
+            turn_l = groups.get('turn_left', 0.0)
+            turn_r = groups.get('turn_right', 0.0)
+            vis_l = groups.get('vis_left', 0.0)
+            vis_r = groups.get('vis_right', 0.0)
+            pitch_up = groups.get('pitch_up', 0.0)
+            pitch_down = groups.get('pitch_down', 0.0)
+            speed = groups.get('speed', 0.0)
+            trigger = groups.get('trigger', 0.0)
+        except Exception:
+            turn_l = turn_r = vis_l = vis_r = pitch_up = pitch_down = speed = trigger = 0.0
+
+        # also include per-type rates for full CNS viz (top types by rate)
+        per_type = {}
+        try:
+            by_type = c.conn.index_by_type()
+            for t in list(by_type.keys())[:50]:  # limit to 50 types for replay size
+                idx = by_type.get(t, [])
+                if idx:
+                    per_type[t] = float(net.group_rate(idx))
+        except Exception:
+            pass
+
+        return {
+            'groups': groups,
+            'population_hz': pop,
+            'spikes_last': spikes,
+            'per_type': per_type,
+            't': float(getattr(net, 't', 0.0)),
+        }
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------- match
 def run_match(scen: Scenario, policy_blue, policy_red,
               cfg: Optional[EnvConfig] = None,
@@ -404,6 +469,10 @@ def run_match(scen: Scenario, policy_blue, policy_red,
     `side_view` is a light dict with the geometry + own state, so a policy can
     be a scripted rule, a linear readout, or a connectome-backed brain.
     Returns (summary, blue_reward_trace).
+
+    If a policy is brain-backed (BrainPolicyAdapter), its group rates and
+    population activity are recorded into frames as `brain` and `brain_red`
+    for the visualizer's brain-firing and fly stick panels.
     """
     env = Dogfight(cfg, rc)
     env.reset(scen)
@@ -415,6 +484,19 @@ def run_match(scen: Scenario, policy_blue, policy_red,
         cr = policy_red(vr, env)
         _, rewards, done, _ = env.step(cb, cr)
         trace.append(rewards["blue"])
+        # record brain snapshots into last frame if present
+        if record and env.frames:
+            try:
+                b_snap = _brain_snapshot_from_policy(policy_blue)
+                if b_snap:
+                    env.frames[-1]['brain'] = b_snap
+                r_snap = _brain_snapshot_from_policy(policy_red)
+                if r_snap:
+                    env.frames[-1]['brain_red'] = r_snap
+            except Exception:
+                pass
         if not record:
+            # keep last frame's brain if we want to clear? but spec says clear frames
+            # we already cleared, so nothing
             env.frames = []
     return env.summary(), trace, env

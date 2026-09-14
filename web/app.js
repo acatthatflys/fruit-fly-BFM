@@ -4,10 +4,14 @@
  * fixed-size icons (a real fighter is 9 m long in a 12 km arena — anything
  * drawn to scale is invisible), with a vertical line down to the ground so
  * altitude is readable.  Everything else is HUD.
+ *
+ * Extra panels:
+ *  - brainView: population rates per group (and per-type when full CNS)
+ *  - flyView: stick & throttle cartoon driven by DN readout
  */
 "use strict";
 
-const COL = { blue: "#4da3ff", red: "#ff5d5d", amber: "#ffc857", green: "#5ddc8a", dim: "#7b8a9c" };
+const COL = { blue: "#4da3ff", red: "#ff5d5d", amber: "#ffc857", green: "#5ddc8a", dim: "#7b8a9c", cyan: "#5de0ff", magenta: "#ff7ac0" };
 const ARENA_R = 12000.0;
 
 const state = {
@@ -34,7 +38,6 @@ function cross3(a, b) {
 // ---------------------------------------------------------------- the view
 function makeCamera() {
   const c = state.cam;
-  // camera sits behind the look-at point, at (yaw, pitch), distance `dist`
   const dir = [Math.cos(c.pitch) * Math.cos(c.yaw), Math.cos(c.pitch) * Math.sin(c.yaw), Math.sin(c.pitch)];
   const eye = sub3(c.target, mul3(dir, c.dist));
   const fwd = norm3(sub3(c.target, eye));
@@ -62,8 +65,6 @@ function drawLine(ctx, a, b, cam, style, width) {
   ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke();
 }
 
-/* Filled world-space quadrilateral.  Used for the ground surface; skipped
- * entirely when any corner is behind the camera rather than half-drawn. */
 function fillQuad(ctx, cam, a, b, c, d, style) {
   const pts = [a, b, c, d].map((p) => project(p, cam));
   if (pts.some((p) => !p)) return;
@@ -94,7 +95,10 @@ function sampleAt(t) {
       es: lerp(A.es || 0, B.es || 0, u), cmd: A.cmd, hp: A.hp,
     };
   };
-  return { t, b: mix("b"), r: mix("r"), g: a.g, hp: a.hp, raw: a };
+  // brain data is not interpolated, just taken from nearest frame
+  const brain = a.brain || b.brain || null;
+  const brain_red = a.brain_red || b.brain_red || null;
+  return { t, b: mix("b"), r: mix("r"), g: a.g, hp: a.hp, raw: a, brain, brain_red };
 }
 
 // ------------------------------------------------------------------ drawing
@@ -102,11 +106,6 @@ function drawWorld(ctx, cam, s) {
   const W = canvasW(), H = canvasH();
   ctx.clearRect(0, 0, W, H);
 
-  // ---- the ground plane ------------------------------------------------
-  // z = 0 is 250 m below the hard floor and 13 km below the ceiling, so the
-  // ground is the one reference that makes "up" and "down" unambiguous on a
-  // 2-D canvas.  Draw it as an actual filled surface (not just a wire grid),
-  // shaded by height above it, then label it.
   const cx = Math.round(cam.eye[0] + cam.fwd[0] * cam.dist / 1000), cy = Math.round(cam.eye[1] + cam.fwd[1] * cam.dist / 1000);
   const step = 2000, span = 16;
   const gx = Math.round(cx / step) * step, gy = Math.round(cy / step) * step;
@@ -120,7 +119,6 @@ function drawWorld(ctx, cam, s) {
     drawLine(ctx, [x, gy - half, 0], [x, gy + half, 0], cam, "rgba(60,84,116,.45)", 1);
     drawLine(ctx, [gx - half, y, 0], [gx + half, y, 0], cam, "rgba(60,84,116,.45)", 1);
   }
-  // a bold outlined square every 10 km so scale is readable without counting lines
   for (let i = -span; i <= span; i += 5) {
     drawLine(ctx, [gx + i * step, gy - half, 0], [gx + i * step, gy + half, 0], cam, "rgba(96,126,164,.55)", 1.5);
     drawLine(ctx, [gx - half, gy + i * step, 0], [gx + half, gy + i * step, 0], cam, "rgba(96,126,164,.55)", 1.5);
@@ -131,7 +129,6 @@ function drawWorld(ctx, cam, s) {
     ctx.font = "11px ui-monospace, monospace";
     ctx.fillText("GROUND  z = 0 m", gl[0] + 6, gl[1] + 12);
   }
-  // arena boundary ring
   ctx.beginPath();
   let started = false;
   for (let a = 0; a <= 360; a += 4) {
@@ -142,7 +139,6 @@ function drawWorld(ctx, cam, s) {
   }
   ctx.strokeStyle = "rgba(120,150,190,.35)"; ctx.setLineDash([4, 6]); ctx.stroke(); ctx.setLineDash([]);
 
-  // trails
   drawTrail(ctx, cam, "b", COL.blue);
   drawTrail(ctx, cam, "r", COL.red);
 }
@@ -165,7 +161,6 @@ function drawAircraft(ctx, cam, ac, color, label, s) {
   const p = project(ac.p, cam);
   if (!p) return;
   const [x, y] = p;
-  // heading on screen, from the horizontal projection of the velocity
   const ahead = add3(ac.p, mul3([Math.cos(ac.psi * Math.PI / 180), Math.sin(ac.psi * Math.PI / 180), 0], 500));
   const q = project(ahead, cam);
   const ang = q ? Math.atan2(q[1] - y, q[0] - x) : 0;
@@ -173,7 +168,6 @@ function drawAircraft(ctx, cam, ac, color, label, s) {
 
   ctx.save();
   ctx.translate(x, y); ctx.rotate(ang);
-  // silhouette: swept-wing dart
   ctx.beginPath();
   ctx.moveTo(size, 0);
   ctx.lineTo(-size * 0.7, size * 0.62);
@@ -185,7 +179,6 @@ function drawAircraft(ctx, cam, ac, color, label, s) {
   ctx.strokeStyle = "rgba(0,0,0,.65)"; ctx.lineWidth = 1; ctx.stroke();
   ctx.restore();
 
-  // bank indicator: a wing line rotated about the icon
   const bank = ac.mu * Math.PI / 180;
   ctx.save();
   ctx.translate(x, y); ctx.rotate(ang + bank);
@@ -193,8 +186,6 @@ function drawAircraft(ctx, cam, ac, color, label, s) {
   ctx.beginPath(); ctx.moveTo(-size * 0.95, 0); ctx.lineTo(size * 0.95, 0); ctx.stroke();
   ctx.restore();
 
-  // altitude leader down to the ground, marked so the direction of "down" is
-  // explicit: a small caret on the ground surface plus an AGL readout.
   const gp = project([ac.p[0], ac.p[1], 0], cam);
   if (gp) {
     ctx.strokeStyle = "rgba(120,150,190,.30)"; ctx.lineWidth = 1;
@@ -213,23 +204,18 @@ function drawAircraft(ctx, cam, ac, color, label, s) {
 }
 
 function drawEngagement(ctx, cam, s) {
-  // nose reference lines
   for (const [ac, color] of [[s.b, COL.blue], [s.r, COL.red]]) {
     const nose = add3(ac.p, mul3([Math.cos(ac.psi * Math.PI / 180) * Math.cos(ac.gam * Math.PI / 180),
       Math.sin(ac.psi * Math.PI / 180) * Math.cos(ac.gam * Math.PI / 180), Math.sin(ac.gam * Math.PI / 180)], 900));
     drawLine(ctx, ac.p, nose, cam, color + "66", 1.5);
   }
-  // gun line + tracer when the trigger is down
   if (s.b.cmd && s.b.cmd[3]) {
     const dir = [Math.cos(s.b.psi * Math.PI / 180) * Math.cos(s.b.gam * Math.PI / 180),
       Math.sin(s.b.psi * Math.PI / 180) * Math.cos(s.b.gam * Math.PI / 180), Math.sin(s.b.gam * Math.PI / 180)];
     const len = 300 + 900 * ((state.t * 3) % 1);
     drawLine(ctx, s.b.p, add3(s.b.p, mul3(dir, len)), cam, COL.amber, 2);
   }
-  // line of sight
   drawLine(ctx, s.b.p, s.r.p, cam, "rgba(160,180,210,.35)", 1);
-  // weapon-engagement-zone bubble around the target
-  const r = s.g ? s.g.rng : 0;
   const inW = s.g && s.g.wez;
   ctx.strokeStyle = inW ? COL.green : "rgba(120,150,190,.25)";
   const p = project(s.r.p, cam);
@@ -243,8 +229,6 @@ function drawEngagement(ctx, cam, s) {
 function updateHUD(s) {
   const g = s.g || {};
   const rp = state.replay || {};
-  // Blue is our fly (the connectome-constrained controller / learner); red is
-  // the opponent.  Show each side's policy name so a replay is self-describing.
   const bName = rp.blue_name || "fly";
   const rName = rp.red_name || "opponent";
   const wez = g.wez ? `<span class="ok">GUN WEZ</span>` : `<span class="warn">—</span>`;
@@ -272,7 +256,7 @@ function updatePanel(s) {
   $("commands").innerHTML =
     cmdBar("roll", c[0], -1, 1) + cmdBar("pull", c[1], -1, 1) +
     cmdBar("throttle", c[2], 0, 1) +
-    `<div class="cmdrow"><span>trigger</span><div class="bar"><span style="left:0;width:${c[3] ? 100 : 0}%"></span></div>
+    `<div class="cmdrow"><span>trigger</span><div class="bar"><span style="left:0;width:${c[3] ? 100 : 0}%\"></span></div>
       <span style="text-align:right">${c[3] ? "FIRE" : "safe"}</span></div>`;
 
   const g = s.g || {};
@@ -291,7 +275,6 @@ function updatePanel(s) {
 }
 
 function updateEvents() {
-  const sel = $("replaySel").value;
   const rp = state.replay;
   if (!rp) return;
   const shown = (rp.events || []).filter((e) => e.t <= state.t + 0.01).slice(-14).reverse();
@@ -299,6 +282,188 @@ function updateEvents() {
     const cls = /shot down|kill/i.test(e.msg) ? "kill" : (/hits/.test(e.msg) ? "hit" : "");
     return `<li class="${cls}">[${fmt(e.t, 1)}s] ${e.msg}</li>`;
   }).join("");
+}
+
+// --------------------------------------------------------------- brain + fly views
+function drawBrainView(s) {
+  const cv = $("brainView");
+  if (!cv) return;
+  const ctx = cv.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.width, H = cv.height;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const w = W/dpr, h = H/dpr;
+  ctx.clearRect(0,0,w,h);
+
+  const brain = s.brain;
+  const hasBrain = !!brain;
+  $("brainMeta").textContent = hasBrain ? `${fmt(brain.population_hz,2)} Hz pop · ${brain.spikes_last} spikes` : "no brain field — run --blue brain";
+
+  // layout: left side groups, right side per-type if full CNS
+  const groups = hasBrain ? brain.groups : null;
+  const perType = hasBrain ? brain.per_type : null;
+
+  if (!hasBrain) {
+    // placeholder: show command-derived pseudo rates
+    const c = s.b.cmd || [0,0,0,false];
+    const roll = c[0], pull = c[1], thr = c[2];
+    const pseudo = [
+      { label: "turn_left", value: Math.max(0, -roll), color: COL.blue },
+      { label: "turn_right", value: Math.max(0, roll), color: COL.red },
+      { label: "pitch_up", value: Math.max(0, pull), color: COL.green },
+      { label: "pitch_down", value: Math.max(0, -pull), color: COL.amber },
+      { label: "speed", value: thr, color: COL.cyan },
+      { label: "trigger", value: c[3]?1:0, color: COL.magenta },
+    ];
+    drawBarGroup(ctx, w, h, pseudo, "pseudo from commands (no brain field)");
+    $("brainLegend").innerHTML = `<span class="dim">No brain data in this replay. Run <span class="mono">python -m flybfm fight --blue brain --replay web/replays/brain.json</span> to record real DN rates.</span>`;
+    return;
+  }
+
+  // real brain data
+  const order = ["turn_left","turn_right","vis_left","vis_right","pitch_up","pitch_down","speed","trigger"];
+  const bars = [];
+  for (const k of order) {
+    if (groups && groups[k] !== undefined) {
+      let col = COL.dim;
+      if (k.includes("left")) col = COL.blue;
+      if (k.includes("right")) col = COL.red;
+      if (k.includes("pitch_up")) col = COL.green;
+      if (k.includes("pitch_down")) col = COL.amber;
+      if (k==="speed") col = COL.cyan;
+      if (k==="trigger") col = COL.magenta;
+      bars.push({ label: k, value: groups[k], color: col });
+    }
+  }
+  // add a few extra groups if present
+  const extra = Object.keys(groups || {}).filter(k=>!order.includes(k)).slice(0,4);
+  for (const k of extra) bars.push({ label: k, value: groups[k], color: COL.dim });
+
+  drawBarGroup(ctx, w, h, bars, "DN + STMD groups");
+
+  // per-type legend for full CNS
+  if (perType && Object.keys(perType).length) {
+    const top = Object.entries(perType).sort((a,b)=>b[1]-a[1]).slice(0,10);
+    $("brainLegend").innerHTML = top.map(([t,v])=>`<span style="color:${COL.blue}">${t}</span> ${fmt(v,2)}Hz`).join(" · ");
+  } else {
+    $("brainLegend").innerHTML = `<span class="dim">groups: ${Object.keys(groups||{}).join(", ")}</span>`;
+  }
+}
+
+function drawBarGroup(ctx, w, h, bars, title) {
+  const pad = 10, labelW = 88, gap = 4;
+  const maxV = Math.max(0.01, ...bars.map(b=>Math.abs(b.value)));
+  const barH = (h - pad*2 - 16) / Math.max(bars.length,1);
+  ctx.fillStyle = "#8aa0b8"; ctx.font = "10px ui-monospace, monospace";
+  ctx.fillText(title, pad, pad+8);
+  bars.forEach((b,i)=>{
+    const y = pad+16 + i*(barH+gap);
+    const x0 = pad+labelW;
+    const bw = (w - x0 - pad) * (Math.abs(b.value)/maxV);
+    // label
+    ctx.fillStyle = "#7b8a9c"; ctx.textAlign="right";
+    ctx.fillText(b.label, x0-6, y+barH*0.6);
+    ctx.textAlign="left";
+    // bar bg
+    ctx.fillStyle = "rgba(22,32,43,0.9)";
+    ctx.fillRect(x0, y, w - x0 - pad, barH);
+    // bar fg
+    ctx.fillStyle = b.color;
+    ctx.fillRect(x0, y, bw, barH);
+    // value
+    ctx.fillStyle = "#cfd8e3"; ctx.font = "10px ui-monospace, monospace";
+    ctx.fillText(fmt(b.value,2), x0 + bw + 4, y+barH*0.6);
+  });
+}
+
+function drawFlyView(s) {
+  const cv = $("flyView");
+  if (!cv) return;
+  const ctx = cv.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.width, H = cv.height;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const w = W/dpr, h = H/dpr;
+  ctx.clearRect(0,0,w,h);
+
+  const c = s.b.cmd || [0,0,0,false];
+  const roll = c[0], pull = c[1], thr = c[2], trig = c[3];
+  const brain = s.brain;
+  const hasBrain = !!brain;
+
+  $("flyMeta").textContent = `${roll>=0?'roll right':'roll left'} ${fmt(Math.abs(roll),2)} · ${pull>=0?'pull up':'push down'} ${fmt(Math.abs(pull),2)} · thr ${fmt(thr,2)} ${trig?'· FIRE':''}`;
+
+  // background
+  ctx.fillStyle = "#0e141c"; ctx.fillRect(0,0,w,h);
+  // grid
+  ctx.strokeStyle = "rgba(60,84,116,.25)"; ctx.lineWidth=1;
+  for (let i=0;i<=4;i++){ const x = w*0.15 + i*(w*0.5/4); ctx.beginPath(); ctx.moveTo(x, h*0.1); ctx.lineTo(x, h*0.85); ctx.stroke(); }
+  for (let i=0;i<=4;i++){ const y = h*0.1 + i*(h*0.75/4); ctx.beginPath(); ctx.moveTo(w*0.15, y); ctx.lineTo(w*0.65, y); ctx.stroke(); }
+
+  // stick base
+  const cx = w*0.4, cy = h*0.5;
+  const range = 60;
+  const sx = cx + roll*range;
+  const sy = cy - pull*range; // pull up = stick back = up on screen? invert: pull up = stick back (down in our coord) — use intuitive: pull up = stick down? Let's keep up = pull up
+  // Actually typical stick: pull back = nose up. We'll map pull>0 to sy lower (toward pilot)
+  const sy2 = cy + pull*range*0.6;
+
+  // base circle
+  ctx.fillStyle = "#16202b"; ctx.beginPath(); ctx.arc(cx, cy, 70, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = "#22303f"; ctx.lineWidth=2; ctx.stroke();
+
+  // cross
+  ctx.strokeStyle = "rgba(123,138,156,.3)"; ctx.beginPath(); ctx.moveTo(cx-70, cy); ctx.lineTo(cx+70, cy); ctx.moveTo(cx, cy-70); ctx.lineTo(cx, cy+70); ctx.stroke();
+
+  // stick shaft
+  ctx.strokeStyle = "#4da3ff"; ctx.lineWidth=4; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(sx, sy2); ctx.stroke();
+
+  // stick top
+  ctx.fillStyle = trig ? "#ff5d5d" : "#4da3ff"; ctx.beginPath(); ctx.arc(sx, sy2, 12, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = "#0a0f15"; ctx.lineWidth=2; ctx.stroke();
+
+  // fly avatar — simple top-down fly with wings that flap with throttle
+  const fx = w*0.82, fy = h*0.45;
+  const flap = Math.sin(Date.now()*0.02 * (0.5 + thr*2)) * (10 + thr*15);
+  ctx.save(); ctx.translate(fx, fy);
+  // body
+  ctx.fillStyle = "#cfd8e3"; ctx.beginPath(); ctx.ellipse(0,0, 10, 22, 0,0,Math.PI*2); ctx.fill();
+  // head
+  ctx.fillStyle = "#ff5d5d"; ctx.beginPath(); ctx.arc(0, -18, 6, 0, Math.PI*2); ctx.fill();
+  // wings
+  ctx.fillStyle = "rgba(93,220,138,.7)";
+  ctx.beginPath(); ctx.ellipse(-14, 2, 18, 6, -0.3 + flap*0.02, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(14, 2, 18, 6, 0.3 - flap*0.02, 0, Math.PI*2); ctx.fill();
+  // arms on stick — lines from fly to stick
+  ctx.strokeStyle = "#7b8a9c"; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(-4, -6); ctx.lineTo(cx - fx + (sx-cx)*0.3, cy - fy + (sy2-cy)*0.3); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(4, -6); ctx.lineTo(cx - fx + (sx-cx)*0.7, cy - fy + (sy2-cy)*0.7); ctx.stroke();
+  ctx.restore();
+
+  // throttle lever
+  const tx = w*0.92, ty0 = h*0.15, ty1 = h*0.85;
+  ctx.fillStyle = "#16202b"; ctx.fillRect(tx-8, ty0, 16, ty1-ty0);
+  ctx.strokeStyle = "#22303f"; ctx.strokeRect(tx-8, ty0, 16, ty1-ty0);
+  const ty = ty1 - thr*(ty1-ty0);
+  ctx.fillStyle = "#5de0ff"; ctx.fillRect(tx-12, ty-6, 24, 12);
+  ctx.fillStyle = "#7b8a9c"; ctx.font="10px ui-monospace, monospace"; ctx.fillText("THR", tx-14, ty0-6);
+  ctx.fillText(fmt(thr*100,0)+"%", tx-16, ty1+12);
+
+  // status text
+  const status = [];
+  if (Math.abs(roll)>0.1) status.push(roll>0?"→ rolling right":"← rolling left");
+  else status.push("→ wings level");
+  if (Math.abs(pull)>0.1) status.push(pull>0?"↑ pulling up":"↓ pushing down");
+  else status.push("↔ pitch neutral");
+  status.push(`throttle ${fmt(thr*100,0)}%`);
+  if (trig) status.push("🔴 TRIGGER DOWN");
+  if (hasBrain) {
+    const g = brain.groups;
+    const lr = (g.turn_right||0)-(g.turn_left||0);
+    const vdiff = (g.vis_right||0)-(g.vis_left||0);
+    status.push(`brain: DN L/R ${fmt(lr,2)}Hz, STMD L/R ${fmt(vdiff,2)}Hz`);
+  }
+  $("flyStatus").innerHTML = status.map(s=>`<span>${s}</span>`).join(" · ");
 }
 
 // --------------------------------------------------------------- strip chart
@@ -351,7 +516,6 @@ function buildStrip() {
     });
     ctx.stroke(); ctx.globalAlpha = 1;
   }
-  // event ticks
   for (const e of (state.replay.events || [])) {
     const x = X(e.t);
     ctx.strokeStyle = /shot down/.test(e.msg) ? COL.green : "rgba(255,200,87,.5)";
@@ -388,7 +552,6 @@ function frame(ts) {
     if (cv.width !== cv.clientWidth * dpr) { cv.width = cv.clientWidth * dpr; cv.height = cv.clientHeight * dpr; }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // camera target: midpoint, biased toward the aircraft in chase mode
     state.cam.target = [(s.b.p[0] + s.r.p[0]) / 2, (s.b.p[1] + s.r.p[1]) / 2, (s.b.p[2] + s.r.p[2]) / 2];
     if (state.cam.mode === "chase-blue") { state.cam.yaw = s.b.psi * Math.PI / 180; state.cam.pitch = 0.35; state.cam.dist = 2200; }
     else if (state.cam.mode === "chase-red") { state.cam.yaw = s.r.psi * Math.PI / 180; state.cam.pitch = 0.35; state.cam.dist = 2200; }
@@ -402,6 +565,10 @@ function frame(ts) {
 
     updateHUD(s); updatePanel(s); updateEvents();
     drawStripPlayhead();
+    drawBrainView(s);
+    drawFlyView(s);
+    // clock
+    $("clock").textContent = fmt(s.t,1)+"s / "+fmt(state.dur,1)+"s";
   }
   requestAnimationFrame(frame);
 }
