@@ -9,12 +9,21 @@ distinction is the difference between a demo and an experiment:
      command channels.  This is the "co-adaptation" that every viral demo
      quietly replaces with a separate conventional neural network.  Here it is
      explicit, small (a few dozen numbers), and it is the thing CEM/ES searches.
+     **100% of the results in runs/ come from this loop.**
 
-  2. CONNECTOME PLASTICITY (inner loop, trained by dopamine)
-     Three-factor Hebbian updates on the KC->MBON-like edges only, gated by the
-     TD-error dopamine signal.  This is slower, noisier, and biologically the
-     interesting part; it is switched off by default because on its own it is
-     not enough to learn gunnery -- which is itself a result worth reporting.
+  2. CONNECTOME PLASTICITY (inner loop, trained by dopamine — the fly's own)
+     Three-factor Hebbian updates on the KC->MBON edges only, gated by the
+     TD-error dopamine signal: Δw = η·e·DA − λw. Implemented in lif.py
+     (mark_plastic, deliver_dopamine) and tested (test_plasticity_path_exists,
+     test_connectome_loader). The synthetic graph has 66 KC→MBON plastic edges;
+     the real MaleCNS mushroom body has thousands. This is slower, noisier, and
+     biologically the interesting part; it is **switched off by default**
+     (plasticity=False) because on its own it is not enough to learn gunnery —
+     which is itself a result worth reporting (doomfly: 3,000 runs, no learning).
+     If you share results publicly, be crisp: *on the synthetic graph, zero of
+     the current learning is the fly's own dopamine-gated plasticity; 100% is
+     the outer CEM loop* — unless you explicitly enabled plasticity=True and
+     measured the ablation.
 
 Readout parameterisation, so the search is not blind:
 
@@ -97,14 +106,30 @@ class ConnectomeController:
                  da_cfg: Optional[DopamineConfig] = None,
                  seed: int = 0,
                  plasticity: bool = False,
-                 name: str = "brain"):
+                 name: str = "brain",
+                 use_torch: bool = False,
+                 torch_device: Optional[str] = None):
         self.name = name
         self.conn = conn if conn is not None else flight_subgraph(
             synthetic_connectome(seed=seed))
-        self.net = LIFNetwork(self.conn, lif_params or LIFParams(dt=0.002),
+        base_net = LIFNetwork(self.conn, lif_params or LIFParams(dt=0.002),
                               seed=seed, plasticity=plasticity)
-        self.n_plastic = (self.net.mark_plastic(PLASTIC_PRE, PLASTIC_POST)
+        self.n_plastic = (base_net.mark_plastic(PLASTIC_PRE, PLASTIC_POST)
                           if plasticity else 0)
+        # Optionally promote to torch path for milestones 5-6 (full CNS needs GPU)
+        if use_torch:
+            try:
+                self.net = base_net.to_torch(device=torch_device, seed=seed)
+                # mark_plastic already done on base, repeat on torch net if needed
+                if plasticity and not self.net.plastic_edges:
+                    self.net.mark_plastic(PLASTIC_PRE, PLASTIC_POST)
+            except Exception as exc:
+                # fall back to Python with a warning — keeps stdlib path working
+                import warnings
+                warnings.warn(f"use_torch=True but torch not available ({exc}); using Python LIF")
+                self.net = base_net
+        else:
+            self.net = base_net
         self.sensors = SensorBank(self.conn, sensor_cfg)
         self.readout = readout or ReadoutParams()
         self.da = DopamineChannel(self.conn, da_cfg)
@@ -237,6 +262,8 @@ def build_controller(kind: str = "connectome", seed: int = 0,
                      neurons: Optional[int] = None,
                      plasticity: bool = False,
                      readout: Optional[ReadoutParams] = None,
+                     use_torch: bool = False,
+                     torch_device: Optional[str] = None,
                      **kw) -> ConnectomeController:
     """`kind`: 'connectome' (synthetic stand-in) or 'malecns' (real data).
 
@@ -262,7 +289,8 @@ def build_controller(kind: str = "connectome", seed: int = 0,
     # so the proprioceptive channel has somewhere to land
     conn = _ensure_mechanosensory(conn, seed=seed)
     return ConnectomeController(conn, readout=readout, seed=seed,
-                                plasticity=plasticity, name=kind, **kw)
+                                plasticity=plasticity, name=kind,
+                                use_torch=use_torch, torch_device=torch_device, **kw)
 
 
 def _ensure_mechanosensory(conn: Connectome, seed: int = 0) -> Connectome:

@@ -26,7 +26,8 @@ from .sim.scripted import POOL_BY_NAME, default_pool
 
 
 # --------------------------------------------------------------------- helpers
-def _policy(name: str, seed: int = 0, params=None, basis: str = "linear"):
+def _policy(name: str, seed: int = 0, params=None, basis: str = "linear",
+            use_torch: bool = False, torch_device: str | None = None):
     if name in POOL_BY_NAME:
         return POOL_BY_NAME[name](seed=seed)
     if name == "random":
@@ -40,7 +41,8 @@ def _policy(name: str, seed: int = 0, params=None, basis: str = "linear"):
     if name in ("brain", "connectome"):
         from .brain.controller import build_controller, ReadoutParams
         c = build_controller("synthetic", seed=seed,
-                             readout=ReadoutParams.from_vector(params) if params else None)
+                             readout=ReadoutParams.from_vector(params) if params else None,
+                             use_torch=use_torch, torch_device=torch_device)
         from .train.policy import BrainPolicyAdapter
         return BrainPolicyAdapter(c)
     raise SystemExit(f"unknown policy '{name}' (try: {', '.join(sorted(POOL_BY_NAME))}, "
@@ -90,9 +92,13 @@ def cmd_train(args) -> int:
     if args.policy == "brain":
         from .train.policy import BrainPolicyAdapter
         from .brain.controller import build_controller
-        ctl = build_controller("synthetic", seed=args.seed)
+        use_torch = getattr(args, "use_torch", False)
+        torch_device = getattr(args, "torch_device", None)
+        ctl = build_controller("synthetic", seed=args.seed, use_torch=use_torch, torch_device=torch_device)
         proto = BrainPolicyAdapter(ctl)
-        factory = lambda p: BrainPolicyAdapter(build_controller("synthetic", seed=args.seed)).with_params(p)
+        factory = lambda p: BrainPolicyAdapter(
+            build_controller("synthetic", seed=args.seed, use_torch=use_torch, torch_device=torch_device)
+        ).with_params(p)
         init = proto.params
     elif args.policy == "features":
         from .train.policy import FeaturePolicy, PolyPolicy
@@ -316,6 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--imitation-episodes", type=int, default=24)
     t.add_argument("--out", default=None)
     t.add_argument("--include-frozen", action="store_true", default=True)
+    t.add_argument("--use-torch", action="store_true", help="use TorchLIFNetwork (CPU/CUDA) for brain policy — required for full CNS")
+    t.add_argument("--torch-device", default=None, help="torch device: cpu, cuda, cuda:0, etc (auto-detect if omitted)")
+    t.add_argument("--plasticity", action="store_true", help="enable inner KC->MBON dopamine-gated plasticity (off by default; 0%% of reported results use it)")
     t.set_defaults(func=cmd_train)
 
     e = sub.add_parser("eval", help="evaluate a checkpoint on held-out setups")
@@ -349,6 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--seed", type=int, default=2)
     pr.add_argument("--steps", type=int, default=250)
     pr.add_argument("--out", default=None)
+    pr.add_argument("--use-torch", action="store_true", help="use TorchLIFNetwork (CPU/CUDA) — ~10-100x faster, needed for full CNS")
+    pr.add_argument("--torch-device", default=None, help="torch device: cpu, cuda, etc")
+    pr.add_argument("--plasticity", action="store_true", help="enable KC->MBON plasticity (off by default)")
     pr.set_defaults(func=cmd_probe)
 
     rp = sub.add_parser("replay", help="rebuild the web viewer manifest")

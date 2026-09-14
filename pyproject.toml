@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fruit-fly-BFM"
+version = "0.1.0"
+description = "Connectome-constrained fruit fly brain flying guns-only BFM: sim, brain, training loop, viewer"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "acatthatflys" }]
+keywords = ["neuroscience", "connectome", "drosophila", "bfm", "reinforcement-learning"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Science/Research",
+]
+dependencies = []
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+data = ["pandas>=1.5", "pyarrow>=12"]
+dev = ["torch>=2.0", "pandas>=1.5", "pyarrow>=12", "neuprint-python>=0.4"]
+all = ["torch>=2.0", "pandas>=1.5", "pyarrow>=12", "neuprint-python>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/acatthatflys/fruit-fly-BFM"
+Documentation = "https://github.com/acatthatflys/fruit-fly-BFM/blob/main/docs/DESIGN.md"
+Repository = "https://github.com/acatthatflys/fruit-fly-BFM"
+
+[project.scripts]
+flybfm = "flybfm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["flybfm", "flybfm.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

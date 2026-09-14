@@ -1,8 +1,13 @@
 # Running it
 
-Everything here runs from the repository root, on stock Python 3.11+, with **no
-numpy, no torch, no simulators to install**. The physics, the connectome model
-and the learning loop are stdlib only. Commands are `python3 -m flybfm ...`.
+Everything here runs from the repository root, on stock Python 3.11+. **Core is stdlib only**
+— no numpy, no torch required for the synthetic 665-neuron brain, sim, and CEM loop.
+Optional deps enable the full 166k-neuron MaleCNS path: `torch` for GPU LIF
+(`TorchLIFNetwork`, ~10-100× faster, required for milestones 5-6), `pandas`/`pyarrow`
+for the flat connectome loader, `neuprint-python` for live queries. See `pyproject.toml`
+and `README.md` for `pip install -e .[torch,data]`.
+
+Commands are `python3 -m flybfm ...`. CI runs `python -m unittest discover -s tests` on every push.
 
 ```
 git clone <this repo> && cd fruit-fly-BFM
@@ -25,10 +30,12 @@ python3 -m flybfm --help
 * Rounds are 20 mm, 511 per fight, ~16.7/s, and a hit does 1/6 damage, so it
   takes ~6 hits on target to kill. Guns only: no missiles anywhere in the repo.
 
-Quick health check, ~1 second, 27 tests:
+Quick health check, ~1 second, 32 tests (27 core + 5 loader regression with synthetic feather fixture):
 
 ```
 python3 -m unittest discover -s tests
+# with optional deps:
+pip install -e .[data] && python -m unittest tests.test_connectome_loader -v
 ```
 
 ---
@@ -196,12 +203,25 @@ Timing, measured on two cores:
 |---|---|---|
 `features` (linear, 76 params) | ~0.05 s / 40 ms | ~5 min |
 `features --basis poly` (296 params) | ~0.05 s | ~5 min (12 s/generation) |
-`brain` (665-neuron connectome) | **~74 s per 12 s fight (~6× slower than real time)** | days — use 2-3 generations |
+`brain` (665-neuron, Python LIF) | **~74 s per 12 s fight (~6× slower than real time)** | days — use 2-3 generations |
+`brain --use-torch` (665-neuron, TorchLIFNetwork CPU) | ~0.5 ms/step, ~2-3 s per fight | ~30 min for 24×24×8 |
+`brain --use-torch --torch-device cuda` (166k/125M full CNS) | ~1-5 ms/step sparse matmul on A100 | enables milestones 5-6 |
 
 The brain path runs end-to-end (verified), and `probe` is how you check it is
-alive, but it is not where any result in this repo came from, and its readout is
-inert until a real mushroom-body subgraph is loaded. Long runs: always
-`python3 -u`.
+alive. The Python LIF is the default for reproducibility; `--use-torch` uses
+`TorchLIFNetwork` with identical equations (`W[post,pre] @ spikes`) and is ~10-100×
+faster — required for the full MaleCNS 166k-neuron graph (pure Python would be
+many orders of magnitude too slow). `LIFNetwork.to_torch()` is the entry point;
+see `flybfm/brain/lif.py` docstring.
+
+**Inner vs outer learning — be crisp if you share results:** the synthetic graph has
+66 KC→MBON plastic edges, but `ConnectomeController` defaults to `plasticity=False`
+and the CEM trainer never enables it. 100% of the results in `runs/` come from the
+outer CEM loop; 0% from the fly's own dopamine-gated plasticity unless you pass
+`--plasticity` (or `plasticity=True`) and measure the ablation. That distinction
+is the difference between a demo and an experiment — see `docs/DESIGN.md` §4 and §10.
+
+Long runs: always `python3 -u`.
 
 ## 4. Evaluate and compare
 
@@ -257,6 +277,8 @@ for 0 hits once the fights are jittered, with 0% of its firing steps inside
 
 ```
 python3 -m flybfm probe --steps 250 --seed 2 --out runs/probe_brain.json
+python3 -m flybfm probe --brain synthetic --use-torch --steps 250   # torch path, ~10× faster
+python3 -m flybfm probe --brain synthetic --plasticity --steps 250  # enable KC->MBON plasticity (off by default)
 ```
 
 Parks a target at a known angle off the nose and reports what the retina, the
@@ -265,7 +287,10 @@ anything in `brain/`: the four ways the brain goes silent all look identical fro
 the outside, and this prints the three numbers that separate them (population
 rate → retinal peak cell → visual L/R difference). The `descending L/R diff`
 verdict is expected to *fail* on the reduced synthetic graph; that is a real
-limitation, reported rather than hidden.
+limitation, reported rather than hidden. `--use-torch` uses `TorchLIFNetwork`
+(CPU or CUDA) with identical dynamics; `--plasticity` enables the inner
+dopamine-gated loop (66 edges in synthetic, off by default — 0% of reported
+results use it).
 
 ## 7. Real connectome data (optional)
 
