@@ -182,6 +182,21 @@ def cmd_train(args) -> int:
               f"learner_wins={row['learner_wins']:3d} opponent_wins={row['opponent_wins']:3d} "
               f"importance={row['importance']:.2f}")
     print(f"artifacts -> {out_dir}/training.json")
+    # clean pid file if this was a live training run (server spawned us)
+    try:
+        if cfg.live_status_path:
+            pid_path = os.path.join(os.path.dirname(cfg.live_status_path), "pid.txt")
+            # only remove if it contains our pid
+            if os.path.exists(pid_path):
+                with open(pid_path) as pf:
+                    try:
+                        pid_in_file = int(pf.read().strip())
+                        if pid_in_file == os.getpid():
+                            os.remove(pid_path)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
     return 0
 
 
@@ -247,9 +262,27 @@ def cmd_replay(args) -> int:
 def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    # check for zombie / defunct on Linux via /proc
+    try:
+        with open(f"/proc/{pid}/status", "r") as fh:
+            for line in fh:
+                if line.startswith("State:"):
+                    # State: Z (zombie) or X (dead) should be considered not alive
+                    if "Z" in line or "X" in line or "zombie" in line.lower():
+                        return False
+                    break
+    except Exception:
+        pass
+    # also check cmdline empty -> zombie
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            if not fh.read().strip():
+                return False
+    except Exception:
+        pass
+    return True
 
 
 def _read_live_status(status_path: str, pid_path: str, log_path: str) -> dict:
@@ -260,8 +293,16 @@ def _read_live_status(status_path: str, pid_path: str, log_path: str) -> dict:
             with open(pid_path) as fh:
                 pid = int(fh.read().strip())
             running = _is_pid_alive(pid)
+            if not running:
+                # clean stale pid file
+                try:
+                    os.remove(pid_path)
+                except Exception:
+                    pass
+                pid = None
         except Exception:
             pid = None
+            running = False
     status = {}
     if os.path.exists(status_path):
         try:

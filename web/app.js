@@ -559,15 +559,61 @@ async function loadManifest() {
   const res = await fetch("replays/index.json", { cache: "no-store" });
   const man = await res.json();
   state.manifest = man;
+  // try to include live.json even if not in manifest yet (training may have created it)
+  let replays = [...man.replays];
+  try {
+    const liveRes = await fetch("replays/live.json", { method: "HEAD", cache: "no-store" });
+    if (liveRes.ok && !replays.some(r => r.file === "live.json")) {
+      replays.unshift({ file: "live.json", tag: "live_best", result: "live", duration_s: 0, blue: "best", red: "live", frames: 0, manoeuvres: 0 });
+    }
+  } catch {}
+  // also check API
+  try {
+    const apiLive = await fetch("/api/train/live", { cache: "no-store" });
+    if (apiLive.ok) {
+      const j = await apiLive.json();
+      if (j && j.generation !== undefined && !replays.some(r => r.file === "live.json")) {
+        replays.unshift({ file: "__live_api__", tag: `live gen ${j.generation}`, result: j.result || "live", duration_s: j.duration_s || 0, blue: j.blue_name || "best", red: j.red_name || "opp", frames: (j.frames||[]).length, manoeuvres: 0, _liveData: j });
+      }
+    }
+  } catch {}
   const sel = $("replaySel");
-  sel.innerHTML = man.replays.map((r, i) =>
-    `<option value="${r.file}">${r.tag} · ${r.result} · ${fmt(r.duration_s, 0)}s · ${r.blue} v ${r.red}</option>`).join("");
-  if (man.replays.length) await loadReplay(man.replays[0].file);
+  sel.innerHTML = replays.map((r, i) =>
+    `<option value="${r.file}" ${r.file==="live.json"?"style=\"color:#5ddc8a;font-weight:600\"":""}>${r.file==="live.json"?"🔴 LIVE — ":""}${r.tag} · ${r.result} · ${fmt(r.duration_s, 0)}s · ${r.blue} v ${r.red}${r.file==="live.json"?" · best result":""}</option>`).join("");
+  // stash for selector handler
+  state.manifest.replays = replays;
+  if (replays.length) {
+    // prefer live if training was running recently
+    const liveOpt = replays.find(r => r.file === "live.json" || r.file === "__live_api__");
+    if (liveOpt && state.autoWatchLive) {
+      if (liveOpt.file === "__live_api__" && liveOpt._liveData) await loadReplayData(liveOpt._liveData);
+      else await loadReplay(liveOpt.file);
+    } else {
+      await loadReplay(replays[0].file);
+    }
+  }
 }
 
 async function loadReplay(file) {
-  const res = await fetch("replays/" + file, { cache: "no-store" });
-  const rp = await res.json();
+  if (file === "__live_api__") {
+    const live = await fetchLiveReplay();
+    if (live) { await loadReplayData(live); return; }
+  }
+  // support live.json via API fallback
+  let rp = null;
+  try {
+    const res = await fetch("replays/" + file, { cache: "no-store" });
+    if (!res.ok) throw new Error("not found in replays/");
+    rp = await res.json();
+  } catch {
+    if (file === "live.json") {
+      rp = await fetchLiveReplay();
+    }
+  }
+  if (!rp) {
+    console.warn("replay not found", file);
+    return;
+  }
   await loadReplayData(rp);
 }
 
@@ -627,7 +673,7 @@ async function fetchLiveReplay() {
 
 function updateTrainUI(data) {
   if (!data) {
-    $("trainStatus").textContent = "idle (no server or no training)";
+    $("trainStatus").textContent = "idle (no server or no training) — run python -m flybfm serve";
     $("trainStatus").className = "trainbar-status mono";
     return;
   }
@@ -641,26 +687,40 @@ function updateTrainUI(data) {
   if (running) {
     $("trainStatus").textContent = `running pid ${data.pid} — gen ${gen !== undefined ? gen : "?"} / ${total} best ${best !== undefined ? best.toFixed(1) : "?"} mean ${mean !== undefined ? mean.toFixed(1) : "?"}`;
     $("trainStatus").className = "trainbar-status mono running";
+    // auto-show training bar when training is running
+    const bar = $("trainBar");
+    if (bar && bar.classList.contains("hidden")) {
+      bar.classList.remove("hidden");
+    }
   } else {
     if (st && st.generation !== undefined) {
-      $("trainStatus").textContent = `stopped — last gen ${gen} / ${total} best ${fmt(best,1)} — click watch live to see best result`;
+      $("trainStatus").textContent = `stopped — last gen ${gen} / ${total} best ${fmt(best,1)} — best result is live replay (auto-loaded below)`;
+      // when training just finished, ensure best result is shown
+      if (state.liveGen >= 0 && state.replay && state.replay.generation === undefined) {
+        // will be loaded by pollTraining's finished check
+      }
     } else {
-      $("trainStatus").textContent = "idle — no training running";
+      $("trainStatus").textContent = "idle — no training running. Click ⚙ train to configure and start.";
     }
     $("trainStatus").className = "trainbar-status mono";
   }
-  // progress panel
-  if (st && st.history) {
-    const hist = st.history.slice(-8);
+  // progress panel — shows best result details
+  if (st && (st.history || st.generation !== undefined)) {
+    const hist = (st.history || []).slice(-8);
     const lines = hist.map(h => {
       const ev = h.eval ? ` win ${(h.eval.win_rate*100).toFixed(0)}% hit ${(h.eval.hit_rate*100).toFixed(1)}%` : "";
       return `gen ${h.generation} best ${fmt(h.best_return,1)} mean ${fmt(h.mean_return,1)} ${h.max_time_s ? h.max_time_s.toFixed(0)+'s' : ''}${ev}`;
     }).join("\n");
     const poolLines = (st.pool || []).slice(0,4).map(r => `${r.name}: ${r.learner_wins}W ${r.opponent_wins}L`).join(" · ");
+    const bestInfo = st.best ? `best score ${fmt(st.best.score,2)} — ${st.best.params ? st.best.params.length + " params" : ""}` : "";
     $("trainProgress").innerHTML = `<b>gen ${st.generation}/${st.total_generations || "?"}</b> best ${fmt(st.best_return,2)} mean ${fmt(st.mean_return,2)}<br>` +
-      (st.eval ? `eval win ${fmt(st.eval.win_rate*100,0)}% loss ${fmt(st.eval.loss_rate*100,0)}% hit ${fmt(st.eval.hit_rate*100,1)}%<br>` : "") +
+      (bestInfo ? `${bestInfo}<br>` : "") +
+      (st.eval ? `eval win ${fmt(st.eval.win_rate*100,0)}% loss ${fmt(st.eval.loss_rate*100,0)}% hit ${fmt(st.eval.hit_rate*100,1)}% — <b>best result</b><br>` : "") +
       `<span class="dim">${lines.replace(/\n/g,"<br>")}</span>` +
-      (poolLines ? `<br><span class="dim">${poolLines}</span>` : "");
+      (poolLines ? `<br><span class="dim">${poolLines}</span>` : "") +
+      `<br><button id="loadBestBtn" class="ghost" style="margin-top:6px">👁 show best result replay</button>`;
+    const btn = $("loadBestBtn");
+    if (btn) btn.onclick = () => watchLive();
   }
 }
 
@@ -668,26 +728,38 @@ async function pollTraining() {
   const status = await fetchTrainStatus();
   updateTrainUI(status);
   const log = await fetchTrainLog();
-  if (log !== null && log.length) {
-    $("trainLog").textContent = log;
-    // auto scroll to bottom
-    $("trainLog").scrollTop = $("trainLog").scrollHeight;
+  if (log !== null) {
+    if (log.length) {
+      $("trainLog").textContent = log;
+      $("trainLog").scrollTop = $("trainLog").scrollHeight;
+    } else if (!status || !status.running) {
+      // keep previous log if empty and not running
+    }
   }
-  // if training running and live replay newer than current, auto-load
-  if (status && status.running) {
-    const live = await fetchLiveReplay();
-    if (live && live.generation !== undefined && live.generation !== state.liveGen) {
-      // only auto-switch if user clicked watch live before or if we are already showing live
-      if (state.autoWatchLive || state.replay && state.replay.generation !== undefined) {
-        state.liveGen = live.generation;
-        await loadReplayData(live);
-      } else {
-        // just update badge count but don't steal user's replay
-        state.liveGen = live.generation;
-        // show hint
-        $("liveBadge").classList.remove("hidden");
-        $("liveBadge").textContent = `LIVE gen ${live.generation} available — click 👁 watch live fly`;
-      }
+  // live replay handling — both while training and after it finishes (best result)
+  const live = await fetchLiveReplay();
+  if (live && live.generation !== undefined) {
+    const isNewGen = live.generation !== state.liveGen;
+    if (isNewGen) state.liveGen = live.generation;
+    // auto-load if:
+    // - user enabled autoWatchLive (clicked start or watch live)
+    // - we are already showing a live replay
+    // - training just finished and we have no replay showing best yet (show best result)
+    const shouldAutoLoad = state.autoWatchLive || (state.replay && state.replay.generation !== undefined) || (!status.running && status.status && status.status.generation !== undefined && !state.hasShownBest);
+    if (shouldAutoLoad && isNewGen) {
+      await loadReplayData(live);
+      state.hasShownBest = true;
+    } else if (isNewGen && !shouldAutoLoad) {
+      // hint that new live is available — don't steal user's current replay
+      $("liveBadge").classList.remove("hidden");
+      $("liveBadge").textContent = `LIVE gen ${live.generation} available — click 👁 watch live fly (best result)`;
+      $("liveBadge").onclick = () => watchLive();
+    }
+    // if training finished and we never showed best, show it now (best result requirement)
+    if (!status.running && live && !state.hasShownBest) {
+      await loadReplayData(live);
+      state.hasShownBest = true;
+      state.autoWatchLive = true;
     }
   }
 }
