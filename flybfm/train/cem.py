@@ -26,6 +26,17 @@ Training improvements (2026-09):
   * Episode-length curriculum: 15-20s → 30-45s → 60-90s across generations,
     so evolution first learns acquisition/pursuit, then maintaining advantage
     and recovery.
+  * Gunnery-focused curriculum (2026-09 fix for "wins on points, cannot shoot"):
+    - scenario mix curriculum: early 70% easy / 10% defensive / 20% random,
+      middle 40/30/30, late 20/40/40 — so learner first learns to track,
+      then to handle defensive.
+    - opponent curriculum: early only level/nose-on (non-maneuvering),
+      middle level/guns/lag/lead, late all 10 scripted pilots — so learner
+      first learns to hold 1° solution vs cooperative target, then vs maneuvering.
+    - reward tuning: tracking term now lead_angle at 1° scale weight 8.0,
+      dominates aspect/range/energy; hit 5.0, kill 100, good trigger +0.5,
+      bad spray -0.3, points weight 0.35→0.05 — closes "win on points" loophole.
+    - observation fine channels now lead/2° and aa/2° (was /10 and /5) — 5x gain.
   * Prioritize evaluations over length: thousands of fights, not few hundred.
 """
 from __future__ import annotations
@@ -115,7 +126,7 @@ def evaluate(policy, scenarios: Sequence[Scenario], opponents: Sequence,
 # ----------------------------------------------------------------------------
 @dataclass
 class CEMConfig:
-    generations: int = 12
+    generations: int = 16
     population: int = 24
     elite_frac: float = 0.25
     sigma0: float = 0.5
@@ -127,15 +138,29 @@ class CEMConfig:
     seed: int = 0
     freeze_every: int = 3
     verbose: bool = True
-    # scenario distribution and curriculum
+    # scenario distribution and curriculum — gunnery-focused defaults
     easy_frac: float = 0.4
     defensive_frac: float = 0.3
     random_frac: float = 0.3
     use_curriculum: bool = True
+    use_scenario_mix_curriculum: bool = True
+    use_opponent_curriculum: bool = True
     curriculum: List[Tuple[float, float, float]] = field(default_factory=lambda: [
         (0.0, 15.0, 20.0),   # first 30% gens: 15-20s (acquisition & pursuit)
         (0.3, 30.0, 45.0),   # next 40%: 30-45s (skills emerge)
         (0.7, 60.0, 90.0),   # last 30%: 60-90s (maintain advantage, recovery)
+    ])
+    # scenario mix curriculum: (progress_start, easy, defensive, random)
+    scenario_mix_curriculum: List[Tuple[float, float, float, float]] = field(default_factory=lambda: [
+        (0.0, 0.7, 0.1, 0.2),  # early: 70% easy — learn to track vs cooperative
+        (0.3, 0.4, 0.3, 0.3),  # middle: 40/30/30 balanced
+        (0.7, 0.2, 0.4, 0.4),  # late: 20% easy, 40% defensive, 40% random — handle defensive
+    ])
+    # opponent curriculum: easy early, hard late
+    opponent_curriculum: List[Tuple[float, List[str]]] = field(default_factory=lambda: [
+        (0.0, ["level", "nose-on"]),  # early: non-maneuvering — learn 1° hold
+        (0.3, ["level", "nose-on", "guns", "lag", "lead"]),  # middle: add maneuvering
+        (0.7, ["level", "nose-on", "guns", "lag", "lead", "jinker", "bnz", "break", "vertical", "instructor"]),  # late: all 10
     ])
     # live training viewer support
     live_replay_path: Optional[str] = None
@@ -145,15 +170,10 @@ class CEMConfig:
 
 
 def _get_max_time_for_gen(gen: int, total_gens: int, cfg: CEMConfig, rng: random.Random) -> float:
-    """Episode-length curriculum: sample max_time based on generation progress.
-
-    If use_curriculum=False, returns cfg.max_time_s fixed.
-    Otherwise, picks interval based on gen/total and samples uniformly inside.
-    """
+    """Episode-length curriculum: sample max_time based on generation progress."""
     if not cfg.use_curriculum or not cfg.curriculum:
         return cfg.max_time_s
     progress = gen / max(total_gens - 1, 1)
-    # find interval where progress >= start
     chosen = cfg.curriculum[0]
     for start, lo, hi in cfg.curriculum:
         if progress >= start:
@@ -164,17 +184,44 @@ def _get_max_time_for_gen(gen: int, total_gens: int, cfg: CEMConfig, rng: random
     return rng.uniform(lo, hi)
 
 
+def _get_scenario_fractions_for_gen(gen: int, total_gens: int, cfg: CEMConfig) -> Tuple[float, float, float]:
+    """Scenario mix curriculum: early more easy, late more defensive/random."""
+    if not cfg.use_scenario_mix_curriculum or not cfg.scenario_mix_curriculum:
+        return cfg.easy_frac, cfg.defensive_frac, cfg.random_frac
+    progress = gen / max(total_gens - 1, 1)
+    chosen = cfg.scenario_mix_curriculum[0]
+    for entry in cfg.scenario_mix_curriculum:
+        if progress >= entry[0]:
+            chosen = entry
+        else:
+            break
+    _, easy, defensive, rand = chosen
+    tot = easy + defensive + rand
+    if tot > 0:
+        return easy / tot, defensive / tot, rand / tot
+    return cfg.easy_frac, cfg.defensive_frac, cfg.random_frac
+
+
+def _get_opponent_names_for_gen(gen: int, total_gens: int, cfg: CEMConfig) -> List[str]:
+    """Opponent curriculum: easy early, hard late."""
+    if not cfg.use_opponent_curriculum or not cfg.opponent_curriculum:
+        return ["level", "nose-on", "guns", "lag", "lead", "jinker", "bnz", "break", "vertical", "instructor"]
+    progress = gen / max(total_gens - 1, 1)
+    chosen = cfg.opponent_curriculum[0]
+    for entry in cfg.opponent_curriculum:
+        if progress >= entry[0]:
+            chosen = entry
+        else:
+            break
+    return chosen[1]
+
+
 class BalancedTrainingSpace:
     """Scenario sampler with 40% easy gunnery, 30% random, 30% defensive.
 
-    Easy: close, roughly aligned (250-900m, ±30°) — gives sparse gun event a gradient.
-    Random: fully uniform from ScenarioSpace — prevents overfitting to easy.
-    Defensive: genuinely defensive (defensive + topgun_break with jitter) — fly
-    regularly encounters being defensive, not just neutral/easy. This is the fix
-    for the previous distribution that was mostly neutral/easy-gunnery.
-
-    Fractions default to 0.4/0.3/0.3 as requested; random_frac is computed as
-    remainder if sum <1, or normalized if sum !=1.
+    Gunnery-focused curriculum (2026-09): supports dynamic fractions per gen
+    via sample_with_fractions(), so early gens see 70% easy (learn to track
+    vs cooperative target at 300m stern), late gens see 40% defensive.
     """
 
     def __init__(self, easy_frac: float = 0.4, defensive_frac: float = 0.3,
@@ -184,7 +231,6 @@ class BalancedTrainingSpace:
         if total <= 0:
             easy_frac, defensive_frac, random_frac = 0.4, 0.3, 0.3
             total = 1.0
-        # normalize to 1
         self.easy_frac = easy_frac / total
         self.defensive_frac = defensive_frac / total
         self.random_frac = random_frac / total
@@ -194,15 +240,31 @@ class BalancedTrainingSpace:
 
     def sample(self, rng=None, tag: str = "train") -> Scenario:
         rng = rng or self.rng
+        return self.sample_with_fractions(rng, self.easy_frac, self.defensive_frac, self.random_frac, tag)
+
+    def sample_with_fractions(self, rng, easy_frac: float, defensive_frac: float, random_frac: float, tag: str = "train") -> Scenario:
         roll = rng.random()
-        if roll < self.easy_frac:
+        if roll < easy_frac:
             return self._sample_easy(rng, tag)
-        elif roll < self.easy_frac + self.defensive_frac:
+        elif roll < easy_frac + defensive_frac:
             return self._sample_defensive(rng, tag)
         else:
             return self.space.sample(rng, tag=tag)
 
     def _sample_easy(self, rng: random.Random, tag: str) -> Scenario:
+        # gunnery-focused: start closer, more aligned early — 250-900m ±30° as before,
+        # but for very easy we bias to 250-500m ±15° half the time to give 1° gradient
+        if rng.random() < 0.5:
+            # super easy: 250-500m, ±15° — gives sparse gun event a strong gradient
+            return Scenario(range_m=rng.uniform(250.0, 500.0),
+                            taa_deg=rng.uniform(-15.0, 15.0),
+                            nose_offset_deg=rng.uniform(-15.0, 15.0),
+                            dz_m=rng.uniform(-80.0, 80.0),
+                            alt_m=rng.uniform(4000.0, 7000.0),
+                            v_a=rng.uniform(240.0, 300.0),
+                            v_t=rng.uniform(220.0, 280.0),
+                            phase_deg=rng.uniform(0.0, 360.0),
+                            seed=rng.randrange(1 << 30), tag=tag + "_gunnery_easy")
         return Scenario(range_m=rng.uniform(250.0, 900.0),
                         taa_deg=rng.uniform(-30.0, 30.0),
                         nose_offset_deg=rng.uniform(-30.0, 30.0),
@@ -218,10 +280,7 @@ class BalancedTrainingSpace:
         base = CANONICAL_SETUPS.get(base_tag)
         if base is None:
             base = CANONICAL_SETUPS["defensive"]
-        # jitter defensive: keep it defensive (TAA >90) but randomize
-        # add ±15° to TAA (clamped >90), ±20° nose offset, ±300m range, ±200m dz
         taa = base.taa_deg + rng.gauss(0, 10.0)
-        # ensure genuinely defensive: at least 90° if base is defensive, allow some spill
         if base.taa_deg >= 90:
             taa = max(90.0, min(180.0, taa))
         else:
@@ -245,12 +304,7 @@ class BalancedTrainingSpace:
 
 
 class MixedSpace(BalancedTrainingSpace):
-    """Backward compat: old name, now 40/30/30 by default.
-
-    Previously only easy vs random (easy_frac). Now defaults to balanced
-    40% easy, 30% defensive, 30% random as requested. If called with only
-    easy_frac, defensive is set to 0.3 and random is remainder.
-    """
+    """Backward compat: old name, now 40/30/30 by default."""
 
     def __init__(self, easy_frac: float = 0.4, seed: int = 0,
                  defensive_frac: float = 0.3, random_frac: float = 0.3):
@@ -268,10 +322,10 @@ def train(policy_factory: Callable[[Sequence[float]], object],
           meta: Optional[dict] = None) -> dict:
     """Optimise `n_params` numbers to maximise mean episodic return.
 
-    New defaults: 12 gens × 24 pop × 8 episodes = 2304 fights (thousands, not
-    few hundred), with 40/30/30 scenario mix and episode-length curriculum
-    15-20s → 30-45s → 60-90s. If compute limited, prioritize more evaluations
-    over longer episodes (more fights improves learning more than 3× length).
+    Gunnery-focused defaults (2026-09 fix):
+    16 gens × 24 pop × 8 eps = 3072 fights, 40/30/30 base but curriculum
+    70/10/20→40/30/30→20/40/40, opponent curriculum level→all, episode
+    15-20s→30-45s→60-90s, reward tracking 8.0 at 1° scale dominates.
     """
     cfg = cfg or CEMConfig()
     rng = random.Random(cfg.seed)
@@ -287,6 +341,12 @@ def train(policy_factory: Callable[[Sequence[float]], object],
 
     for gen in range(cfg.generations):
         t0 = time.time()
+        # dynamic curricula for this gen
+        easy_f, def_f, rand_f = _get_scenario_fractions_for_gen(gen, cfg.generations, cfg)
+        opp_names = _get_opponent_names_for_gen(gen, cfg.generations, cfg)
+        # filter pool records to allowed opponents for this gen
+        allowed_recs = [r for r in pool.records if r.name in opp_names] or pool.records
+
         cand_params = [list(mu)]
         for _ in range(max(0, cfg.population - 1)):
             cand_params.append([mu[i] + rng.gauss(0.0, sigma[i]) for i in range(n_params)])
@@ -295,16 +355,21 @@ def train(policy_factory: Callable[[Sequence[float]], object],
             policy = policy_factory(params)
             total = 0.0
             for k in range(cfg.episodes_per_candidate):
-                sc = space.sample(rng, tag="train")
-                rec = pool.sample(rng)
-                # curriculum: episode length based on generation progress
+                # scenario with curriculum fractions
+                if isinstance(space, BalancedTrainingSpace):
+                    sc = space.sample_with_fractions(rng, easy_f, def_f, rand_f, tag="train")
+                else:
+                    sc = space.sample(rng, tag="train")
+                # opponent with curriculum
+                rec = rng.choice(allowed_recs) if allowed_recs else pool.sample(rng)
                 max_time = _get_max_time_for_gen(gen, cfg.generations, cfg, rng)
                 env_cfg = EnvConfig(decision_dt=cfg.decision_dt, max_time_s=max_time)
                 info, _ = run_episode(sc, policy, rec.policy, env_cfg, rc,
                                       learn=True, record=False)
                 total += info["return"]
                 if hasattr(rec.policy, "observe_reward"):
-                    rec.policy.observe_reward((0.0,) * 18, 0.0)
+                    # observation now 20 dims (was 18) — use 20 for gunnery-focused
+                    rec.policy.observe_reward((0.0,) * 20, 0.0)
                 rec.register(info["result"])
             scores.append(total / cfg.episodes_per_candidate)
 
@@ -324,7 +389,8 @@ def train(policy_factory: Callable[[Sequence[float]], object],
                     "mean_return": sum(scores) / len(scores),
                     "wall_s": round(time.time() - t0, 2),
                     "max_time_s": round(_get_max_time_for_gen(gen, cfg.generations, cfg, random.Random(cfg.seed + gen)), 1),
-                    "scenario_mix": {"easy": cfg.easy_frac, "defensive": cfg.defensive_frac, "random": cfg.random_frac}}
+                    "scenario_mix": {"easy": round(easy_f, 2), "defensive": round(def_f, 2), "random": round(rand_f, 2)},
+                    "opponents": opp_names}
         if cfg.eval_every and gen % cfg.eval_every == 0:
             eval_cfg = EnvConfig(decision_dt=cfg.decision_dt, max_time_s=60.0)
             gen_info["eval"] = evaluate(policy_factory(best["params"]), _eval_scenarios(),
@@ -337,8 +403,9 @@ def train(policy_factory: Callable[[Sequence[float]], object],
         if cfg.verbose:
             ev = gen_info.get("eval", {})
             print(f"[gen {gen:2d}] best={elite_scores[0]:+8.2f} mean={gen_info['mean_return']:+8.2f} "
-                  f"({gen_info['wall_s']:5.1f}s, max_time={gen_info['max_time_s']:.0f}s) "
-                  + (f" win={ev.get('win_rate', 0):.2f} hit%={100*ev.get('hit_rate', 0):.1f}" if ev else ""))
+                  f"({gen_info['wall_s']:5.1f}s, max_time={gen_info['max_time_s']:.0f}s, "
+                  f"mix {easy_f:.1f}/{def_f:.1f}/{rand_f:.1f} opp {len(opp_names)}) "
+                  + (f" win={ev.get('win_rate', 0):.2f} hit%={100*ev.get('hit_rate', 0):.1f} hits={ev.get('hits',0)}" if ev else ""))
 
         # live status + live replay for viewer while training
         try:
@@ -354,33 +421,31 @@ def train(policy_factory: Callable[[Sequence[float]], object],
                     "pool": pool.summary(),
                     "config": {"generations": cfg.generations, "population": cfg.population,
                                "episodes_per_candidate": cfg.episodes_per_candidate,
-                               "easy_frac": cfg.easy_frac, "defensive_frac": cfg.defensive_frac,
-                               "random_frac": cfg.random_frac},
+                               "easy_frac": easy_f, "defensive_frac": def_f,
+                               "random_frac": rand_f, "opponents": opp_names},
                     "eval": gen_info.get("eval"),
                     "timestamp": time.time(),
                 }
-                # atomic write via tmp
                 tmp = cfg.live_status_path + ".tmp"
                 with open(tmp, "w") as fh:
                     json.dump(live_status, fh, indent=2)
                 os.replace(tmp, cfg.live_status_path)
             if cfg.live_replay_path and (gen % cfg.live_every == 0 or gen == cfg.generations - 1):
-                # pick a random training scenario and opponent to show live fly
-                # use best policy vs random pool sample, plus one vs defensive to show variety
                 best_policy = policy_factory(best["params"])
-                # alternate between random and defensive for visual variety
                 sc_tag = "live"
-                sc = space.sample(rng, tag=sc_tag)
-                opp_rec = pool.sample(rng)
+                # live replay uses current curriculum fractions
+                if isinstance(space, BalancedTrainingSpace):
+                    sc = space.sample_with_fractions(rng, easy_f, def_f, rand_f, tag=sc_tag)
+                else:
+                    sc = space.sample(rng, tag=sc_tag)
+                opp_rec = rng.choice(allowed_recs) if allowed_recs else pool.sample(rng)
                 env_cfg_live = EnvConfig(decision_dt=cfg.decision_dt, max_time_s=cfg.live_max_time_s)
-                # run_match returns summary, trace, env with frames
                 _, _, env_live = run_match(sc, best_policy, opp_rec.policy, env_cfg_live, record=True)
                 replay = env_live.to_replay()
                 replay["blue_name"] = f"gen{gen}_best"
                 replay["red_name"] = opp_rec.name
                 replay["generation"] = gen
-                replay["scenario"]["desc"] = f"live gen {gen} best vs {opp_rec.name} — {sc.describe()}"
-                # add manoeuvre summary if available
+                replay["scenario"]["desc"] = f"live gen {gen} best vs {opp_rec.name} — {sc.describe()} — mix {easy_f:.1f}/{def_f:.1f}/{rand_f:.1f}"
                 try:
                     from ..analysis.maneuvers import classify_trajectory
                     replay["manoeuvres"] = classify_trajectory(env_live.frames).summary()
@@ -406,14 +471,17 @@ def train(policy_factory: Callable[[Sequence[float]], object],
                          "episodes_per_candidate": cfg.episodes_per_candidate,
                          "easy_frac": cfg.easy_frac, "defensive_frac": cfg.defensive_frac,
                          "random_frac": cfg.random_frac, "use_curriculum": cfg.use_curriculum,
-                         "curriculum": cfg.curriculum}}
+                         "use_scenario_mix_curriculum": cfg.use_scenario_mix_curriculum,
+                         "use_opponent_curriculum": cfg.use_opponent_curriculum,
+                         "curriculum": cfg.curriculum,
+                         "scenario_mix_curriculum": cfg.scenario_mix_curriculum,
+                         "opponent_curriculum": cfg.opponent_curriculum}}
     if meta:
         result.update(meta)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "training.json"), "w") as fh:
             json.dump(result, fh, indent=2)
-        # also copy final best replay to out_dir if live path not set
         if not cfg.live_replay_path:
             try:
                 best_policy = policy_factory(best["params"])

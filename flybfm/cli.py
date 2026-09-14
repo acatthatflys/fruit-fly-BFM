@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import os
+import platform
 import random
 import sys
 import time
@@ -22,6 +23,7 @@ import signal
 from http import HTTPStatus
 import http.server
 import socketserver
+import multiprocessing
 
 from .analysis.metrics import episode_metrics, format_scorecard, scorecard
 from .sim.arena import CANONICAL_SETUPS, Scenario, ScenarioSpace
@@ -55,13 +57,43 @@ def _policy(name: str, seed: int = 0, params=None, basis: str = "linear",
 
 
 def _scenario(tag: str, seed: int, random_space: bool) -> Scenario:
-    # --random wins over --tag: it is the whole point of the flag
     if random_space:
         return ScenarioSpace().sample(random.Random(seed), tag="random")
     if tag in CANONICAL_SETUPS:
         s = CANONICAL_SETUPS[tag]
         return Scenario(**{**s.__dict__, "seed": seed})
     raise SystemExit(f"unknown tag '{tag}'; known: {', '.join(CANONICAL_SETUPS)}")
+
+
+def _bench_time_per_fight(n_fights: int = 8, max_time_s: float = 20.0, decision_dt: float = 0.1) -> dict:
+    """Quick benchmark: run n_fights with random vs level to estimate fight cost."""
+    from .train.policy import RandomPolicy
+    import time as _time
+    space = ScenarioSpace()
+    rng = random.Random(0)
+    env_cfg = EnvConfig(max_time_s=max_time_s, decision_dt=decision_dt)
+    rc = RewardConfig()
+    blue = RandomPolicy(seed=0)
+    red = POOL_BY_NAME["level"](seed=1)
+    times = []
+    for i in range(n_fights):
+        sc = space.sample(rng, tag="bench")
+        t0 = _time.time()
+        # run_match does full env
+        run_match(sc, blue, red, env_cfg, rc, record=False)
+        times.append(_time.time() - t0)
+    avg = sum(times) / len(times) if times else 0.05
+    return {
+        "n_fights": n_fights,
+        "max_time_s": max_time_s,
+        "decision_dt": decision_dt,
+        "avg_fight_s": avg,
+        "fights_per_second": (1.0 / avg) if avg > 0 else 0,
+        "total_fight_time_s": sum(times),
+        "cpu_count": multiprocessing.cpu_count(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+    }
 
 
 # ------------------------------------------------------------------- commands
@@ -90,10 +122,9 @@ def cmd_train(args) -> int:
     from .train.league import OpponentPool
     out_dir = args.out or os.path.join("runs", args.policy)
     pool = OpponentPool(seed=args.seed)
-    if not args.include_frozen:
-        pass
     basis = getattr(args, "basis", "linear")
-    n_params = {"features": 4 * 19, "brain": 10}.get(args.policy)
+    # n_params now 84 linear (20*4+4) or 396 poly (99*4) — compute from proto later
+    n_params = {"features": 84, "brain": 10}.get(args.policy, 84)
     if args.policy == "brain":
         from .train.policy import BrainPolicyAdapter
         from .brain.controller import build_controller
@@ -132,11 +163,9 @@ def cmd_train(args) -> int:
     if args.policy == "brain":
         init = globals().get("init", None)
 
-    # curriculum + scenario mix
     easy_frac = getattr(args, "easy_frac", 0.4)
     defensive_frac = getattr(args, "defensive_frac", 0.3)
     random_frac = getattr(args, "random_frac", 0.3)
-    # normalize if needed
     tot = easy_frac + defensive_frac + random_frac
     if tot > 0:
         easy_frac /= tot
@@ -149,6 +178,8 @@ def cmd_train(args) -> int:
                     eval_every=args.eval_every,
                     easy_frac=easy_frac, defensive_frac=defensive_frac, random_frac=random_frac,
                     use_curriculum=not getattr(args, "no_curriculum", False),
+                    use_scenario_mix_curriculum=not getattr(args, "no_scenario_mix_curriculum", False),
+                    use_opponent_curriculum=not getattr(args, "no_opponent_curriculum", False),
                     live_replay_path=getattr(args, "live_replay", None),
                     live_status_path=getattr(args, "live_status", None),
                     live_every=getattr(args, "live_every", 1),
@@ -158,15 +189,27 @@ def cmd_train(args) -> int:
     total_fights = cfg.generations * cfg.population * cfg.episodes_per_candidate
     print(f"training {args.policy} ({basis} basis): {n_params} parameters, "
           f"{cfg.generations} gens x {cfg.population} pop x {cfg.episodes_per_candidate} ep = {total_fights} fights")
-    print(f"scenario mix: easy {100*cfg.easy_frac:.0f}% gunnery (250-900m ±30°), "
+    print(f"scenario mix: easy {100*cfg.easy_frac:.0f}% gunnery (250-900m ±30°, super-easy 250-500m ±15° half), "
           f"defensive {100*cfg.defensive_frac:.0f}% (defensive/topgun_break jitter), "
           f"random {100*cfg.random_frac:.0f}% fully random")
     if cfg.use_curriculum:
-        print(f"curriculum: episode length 15-20s → 30-45s → 60-90s across generations")
+        print(f"curriculum: episode 15-20s→30-45s→60-90s, scenario mix 70/10/20→40/30/30→20/40/40, opponent level→all")
+        print(f"  reward: tracking lead_angle 1° weight 12.0 dominates, hit 10 kill 100, good trigger +2.0 bad -0.05, points 0.05, obs 20d lead AA direction + tanh fine")
     else:
         print(f"curriculum: off, fixed max_time {cfg.max_time_s}s")
     if cfg.live_replay_path:
         print(f"live replay -> {cfg.live_replay_path}, status -> {cfg.live_status_path}")
+
+    # quick bench for estimated time
+    try:
+        bench = _bench_time_per_fight(n_fights=4, max_time_s=20.0, decision_dt=cfg.decision_dt)
+        est_s = total_fights * bench["avg_fight_s"]
+        # curriculum makes early fights shorter (15-20s) so ~0.7x avg
+        est_s *= 0.75
+        print(f"bench: avg fight {bench['avg_fight_s']*1000:.0f}ms ({bench['fights_per_second']:.1f} fights/s) on {bench['cpu_count']} CPUs")
+        print(f"estimated training time: {est_s/60:.1f} min ({est_s:.0f}s) for {total_fights} fights — prioritizes evals over length")
+    except Exception as e:
+        print(f"bench failed: {e}")
 
     from .train.cem import BalancedTrainingSpace
     space = BalancedTrainingSpace(easy_frac=cfg.easy_frac, defensive_frac=cfg.defensive_frac,
@@ -182,11 +225,9 @@ def cmd_train(args) -> int:
               f"learner_wins={row['learner_wins']:3d} opponent_wins={row['opponent_wins']:3d} "
               f"importance={row['importance']:.2f}")
     print(f"artifacts -> {out_dir}/training.json")
-    # clean pid file if this was a live training run (server spawned us)
     try:
         if cfg.live_status_path:
             pid_path = os.path.join(os.path.dirname(cfg.live_status_path), "pid.txt")
-            # only remove if it contains our pid
             if os.path.exists(pid_path):
                 with open(pid_path) as pf:
                     try:
@@ -218,7 +259,6 @@ def cmd_eval(args) -> int:
 
 
 def cmd_league(args) -> int:
-    """Round-robin the scripted pool: is the pool actually discriminating?"""
     import itertools
     names = list(POOL_BY_NAME)
     rng = random.Random(args.seed)
@@ -243,7 +283,6 @@ def cmd_league(args) -> int:
 
 
 def cmd_gunnery(args) -> int:
-    """Does the learner ever put the pipper on the target?  Win rate cannot tell you."""
     from .tools.gunnery_check import gunnery_check
     args.params = args.checkpoint or os.path.join("runs", "features", "training.json")
     return gunnery_check(args)
@@ -258,24 +297,38 @@ def cmd_replay(args) -> int:
     return _rebuild_manifest(args.dir)
 
 
-# ------------------------------------------------------------------ serve with live training API
+# ------------------------------------------------------------------ serve with live training API + bench
+_bench_cache = None
+_bench_time = 0
+
+def _get_bench():
+    global _bench_cache, _bench_time
+    now = time.time()
+    if _bench_cache is None or now - _bench_time > 30:
+        try:
+            _bench_cache = _bench_time_per_fight(n_fights=6, max_time_s=20.0, decision_dt=0.1)
+            _bench_time = now
+        except Exception as e:
+            _bench_cache = {"error": str(e), "avg_fight_s": 0.05, "fights_per_second": 20,
+                            "cpu_count": multiprocessing.cpu_count(), "platform": platform.platform()}
+            _bench_time = now
+    return _bench_cache
+
+
 def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    # check for zombie / defunct on Linux via /proc
     try:
         with open(f"/proc/{pid}/status", "r") as fh:
             for line in fh:
                 if line.startswith("State:"):
-                    # State: Z (zombie) or X (dead) should be considered not alive
                     if "Z" in line or "X" in line or "zombie" in line.lower():
                         return False
                     break
     except Exception:
         pass
-    # also check cmdline empty -> zombie
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as fh:
             if not fh.read().strip():
@@ -294,7 +347,6 @@ def _read_live_status(status_path: str, pid_path: str, log_path: str) -> dict:
                 pid = int(fh.read().strip())
             running = _is_pid_alive(pid)
             if not running:
-                # clean stale pid file
                 try:
                     os.remove(pid_path)
                 except Exception:
@@ -316,22 +368,18 @@ def _read_live_status(status_path: str, pid_path: str, log_path: str) -> dict:
 
 
 class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
-    """Serves web/ statically plus /api/train/* endpoints."""
-
     def __init__(self, *args, web_dir=None, runs_dir=None, **kwargs):
         self.web_dir = web_dir or "web"
         self.runs_dir = runs_dir or "runs/live"
         super().__init__(*args, directory=self.web_dir, **kwargs)
 
     def log_message(self, format, *args):
-        # quieter than default, but keep for debugging
         sys.stderr.write(f"{self.client_address[0]} - - [{self.log_date_time_string()}] {format % args}\n")
 
     def do_GET(self):
         if self.path.startswith("/api/"):
             self._handle_api_get()
         else:
-            # default static file serving
             return super().do_GET()
 
     def do_POST(self):
@@ -341,7 +389,6 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def _handle_api_get(self):
-        # /api/train/status
         if self.path.startswith("/api/train/status"):
             status_path = os.path.join(self.runs_dir, "status.json")
             pid_path = os.path.join(self.runs_dir, "pid.txt")
@@ -349,14 +396,11 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             data = _read_live_status(status_path, pid_path, log_path)
             self._send_json(data)
             return
-        # /api/train/live -> serve live replay if exists
         if self.path.startswith("/api/train/live"):
-            # support ?raw=1 to get raw file
             live_path = os.path.join(self.web_dir, "replays", "live.json")
             alt_path = os.path.join(self.runs_dir, "live.json")
             path = live_path if os.path.exists(live_path) else alt_path
             if not os.path.exists(path):
-                # also check configured live path from last training
                 self._send_json({"error": "no live replay yet", "path": path}, status=HTTPStatus.NOT_FOUND)
                 return
             try:
@@ -366,7 +410,6 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
-        # /api/train/log?lines=200
         if self.path.startswith("/api/train/log"):
             log_path = os.path.join(self.runs_dir, "train.log")
             lines = 200
@@ -381,9 +424,7 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
                 self._send_json({"log": "", "error": "no log file"})
                 return
             try:
-                # tail
                 with open(log_path, "rb") as fh:
-                    # crude tail
                     fh.seek(0, os.SEEK_END)
                     size = fh.tell()
                     block = 8192
@@ -396,15 +437,37 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
                         if size == 0:
                             break
                     text = data.decode(errors="ignore")
-                    # keep last N lines
                     out_lines = text.splitlines()[-lines:]
                 self._send_json({"log": "\n".join(out_lines)})
             except Exception as e:
                 self._send_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
-        # /api/replays -> manifest
+        if self.path.startswith("/api/bench"):
+            bench = _get_bench()
+            # also estimate for current live config if available
+            status_path = os.path.join(self.runs_dir, "status.json")
+            try:
+                if os.path.exists(status_path):
+                    with open(status_path) as fh:
+                        st = json.load(fh)
+                    cfg = st.get("config", {})
+                    gens = cfg.get("generations", 12)
+                    pop = cfg.get("population", 24)
+                    eps = cfg.get("episodes_per_candidate", 8)
+                    bench["current_estimated_total_s"] = gens * pop * eps * bench["avg_fight_s"] * 0.75
+            except Exception:
+                pass
+            self._send_json(bench)
+            return
+        if self.path.startswith("/api/system"):
+            self._send_json({
+                "cpu_count": multiprocessing.cpu_count(),
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+                "bench": _get_bench(),
+            })
+            return
         if self.path.startswith("/api/replays"):
-            # serve index.json
             idx_path = os.path.join(self.web_dir, "replays", "index.json")
             if os.path.exists(idx_path):
                 with open(idx_path) as fh:
@@ -415,7 +478,6 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "API endpoint not found")
 
     def _handle_api_post(self):
-        # read body
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         try:
@@ -424,11 +486,9 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             data = {}
 
         if self.path.startswith("/api/train/start"):
-            # start training subprocess in terminal (server's terminal), not in browser thread
             status_path = os.path.join(self.runs_dir, "status.json")
             pid_path = os.path.join(self.runs_dir, "pid.txt")
             log_path = os.path.join(self.runs_dir, "train.log")
-            # check if already running
             if os.path.exists(pid_path):
                 try:
                     with open(pid_path) as fh:
@@ -442,8 +502,7 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             os.makedirs(self.runs_dir, exist_ok=True)
             os.makedirs(os.path.join(self.web_dir, "replays"), exist_ok=True)
 
-            # build command from posted config
-            generations = int(data.get("generations", 12))
+            generations = int(data.get("generations", 16))
             population = int(data.get("population", 24))
             episodes = int(data.get("episodes", 8))
             policy = data.get("policy", "features")
@@ -454,6 +513,8 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             random_frac = float(data.get("random_frac", 0.3))
             max_time = float(data.get("max_time", 30.0))
             no_curriculum = bool(data.get("no_curriculum", False))
+            no_scenario_mix = bool(data.get("no_scenario_mix_curriculum", False))
+            no_opponent = bool(data.get("no_opponent_curriculum", False))
 
             live_replay = os.path.abspath(os.path.join(self.web_dir, "replays", "live.json"))
             live_status = os.path.abspath(status_path)
@@ -478,15 +539,15 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             ]
             if no_curriculum:
                 cmd.append("--no-curriculum")
-            # optional: imitation init
+            if no_scenario_mix:
+                cmd.append("--no-scenario-mix-curriculum")
+            if no_opponent:
+                cmd.append("--no-opponent-curriculum")
             if data.get("init"):
                 cmd.extend(["--init", str(data["init"])])
 
-            # launch detached, log to file, survives browser close (but not server close unless nohup)
-            # Use Popen with stdout/stderr to log file
             try:
                 log_fh = open(log_path, "w")
-                # start new process group so we can kill it later
                 proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
                                         start_new_session=True, cwd=os.getcwd())
                 with open(pid_path, "w") as pf:
@@ -505,7 +566,6 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
             try:
                 with open(pid_path) as fh:
                     pid = int(fh.read().strip())
-                # kill process group
                 try:
                     os.killpg(os.getpgid(pid), signal.SIGTERM)
                 except Exception:
@@ -516,7 +576,6 @@ class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
                         os.killpg(os.getpgid(pid), signal.SIGKILL)
                     except Exception:
                         os.kill(pid, signal.SIGKILL)
-                # clean pid file
                 try:
                     os.remove(pid_path)
                 except Exception:
@@ -543,7 +602,6 @@ def cmd_serve(args) -> int:
     runs_dir = getattr(args, "runs_dir", os.path.join("runs", "live"))
     os.makedirs(web_dir, exist_ok=True)
     os.makedirs(runs_dir, exist_ok=True)
-    # ensure replays dir exists
     os.makedirs(os.path.join(web_dir, "replays"), exist_ok=True)
 
     handler = lambda *a, **kw: LiveTrainingHandler(*a, web_dir=web_dir, runs_dir=runs_dir, **kw)
@@ -553,6 +611,7 @@ def cmd_serve(args) -> int:
         print(f"  status: GET http://{args.host}:{args.port}/api/train/status")
         print(f"  live replay: GET http://{args.host}:{args.port}/api/train/live")
         print(f"  log tail: GET http://{args.host}:{args.port}/api/train/log?lines=200")
+        print(f"  bench: GET http://{args.host}:{args.port}/api/bench")
         print(f"  training out dir: {os.path.abspath(runs_dir)}")
         print(f"  training survives browser close (runs in terminal/server process)")
         print(f"  Ctrl-C to stop server (training subprocess will keep running unless stopped via API)")
@@ -565,7 +624,6 @@ def cmd_serve(args) -> int:
 
 # ------------------------------------------------------------------- plumbing
 def _load_checkpoint(path):
-    """Return {params, basis} from a training.json."""
     if not path:
         return {"params": None, "basis": "linear"}
     with open(path) as fh:
@@ -644,8 +702,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     t = sub.add_parser("train", help="train a policy by CEM/ES")
     t.add_argument("--policy", default="features", choices=["features", "brain"])
-    t.add_argument("--generations", type=int, default=12,
-                   help="number of generations (default 12, ~2304 fights with new defaults)")
+    t.add_argument("--generations", type=int, default=16,
+                   help="number of generations (default 16, ~3072 fights with gunnery-focused defaults)")
     t.add_argument("--population", type=int, default=24,
                    help="candidates per generation (default 24)")
     t.add_argument("--episodes", type=int, default=8,
@@ -666,6 +724,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fraction fully random starts (default 0.3)")
     t.add_argument("--no-curriculum", action="store_true",
                    help="disable episode-length curriculum (15-20s→30-45s→60-90s)")
+    t.add_argument("--no-scenario-mix-curriculum", action="store_true",
+                   help="disable scenario mix curriculum 70/10/20→40/30/30→20/40/40")
+    t.add_argument("--no-opponent-curriculum", action="store_true",
+                   help="disable opponent curriculum level→all")
     t.add_argument("--live-replay", default=None,
                    help="write live best-vs-random replay each gen for viewer (e.g. web/replays/live.json)")
     t.add_argument("--live-status", default=None,

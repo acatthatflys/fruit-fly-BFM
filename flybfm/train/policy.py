@@ -29,9 +29,13 @@ from ..sim.aircraft import Command
 
 
 class FeaturePolicy:
-    """Linear policy over the engineered observation, with saturation."""
+    """Linear policy over the engineered observation, with saturation.
 
-    N_IN = 18
+    Gunnery-focused (2026-09): N_IN 18→20 adds lead AA coarse/fine for direction
+    to ballistic lead point, so policy knows which way to pull for lead pursuit.
+    """
+
+    N_IN = 20
     N_OUT = 4             # roll, pull, throttle, trigger logit
 
     def __init__(self, params: Optional[Sequence[float]] = None, hidden: int = 0,
@@ -102,8 +106,11 @@ class FeaturePolicy:
 # ones (nose, aspect, range, closure, LOS rate, speed, lead error) is small
 # enough that ridge regression can fit it from a few thousand demonstrated
 # samples, and therefore small enough for CEM to refine.
+#
+# Gunnery-focused (2026-09): N_IN 18→20 adds lead AA coarse/fine (18,19) for
+# direction to ballistic lead point. Subset now includes 15 (lead mag) + 18,19.
 # --------------------------------------------------------------------------- #
-QUAD_SUBSET = (0, 1, 2, 4, 5, 6, 7, 8, 9, 15)
+QUAD_SUBSET = (0, 1, 2, 4, 5, 6, 7, 8, 9, 15, 18, 19)
 
 
 def quad_features(phi: Sequence[float], subset=QUAD_SUBSET) -> List[float]:
@@ -117,9 +124,12 @@ def quad_features(phi: Sequence[float], subset=QUAD_SUBSET) -> List[float]:
 
 
 class PolyPolicy:
-    """Linear readout on a quadratic expansion of the observation."""
+    """Linear readout on a quadratic expansion of the observation.
 
-    N_IN = 18
+    Gunnery-focused (2026-09): N_IN 20, includes lead AA direction.
+    """
+
+    N_IN = 20
     N_OUT = 4
 
     def __init__(self, params: Optional[Sequence[float]] = None, seed: int = 0,

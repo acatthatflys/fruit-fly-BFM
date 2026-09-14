@@ -648,6 +648,16 @@ async function loadReplayData(rp) {
 }
 
 // -------------------------------------------------------------- live training
+let benchCache = null;
+async function fetchBench() {
+  try {
+    const res = await fetch("/api/bench", { cache: "no-store" });
+    if (!res.ok) return null;
+    const j = await res.json();
+    benchCache = j;
+    return j;
+  } catch { return null; }
+}
 async function fetchTrainStatus() {
   try {
     const res = await fetch("/api/train/status", { cache: "no-store" });
@@ -669,6 +679,40 @@ async function fetchLiveReplay() {
     if (!res.ok) return null;
     return await res.json();
   } catch { return null; }
+}
+
+function fmtTime(s) {
+  if (s < 60) return `${s.toFixed(0)}s`;
+  if (s < 3600) return `${(s/60).toFixed(1)} min`;
+  return `${(s/3600).toFixed(1)}h (${(s/60).toFixed(0)} min)`;
+}
+
+function updateEstTime() {
+  const gens = parseInt($("trainGens").value, 10) || 16;
+  const pop = parseInt($("trainPop").value, 10) || 24;
+  const eps = parseInt($("trainEps").value, 10) || 8;
+  const totalFights = gens * pop * eps;
+  const bench = benchCache;
+  let avgFightS = 0.05; // fallback 50ms
+  let fightsPerSec = 20;
+  let cpuCount = navigator.hardwareConcurrency || 4;
+  let platformStr = "";
+  if (bench) {
+    avgFightS = bench.avg_fight_s || 0.05;
+    fightsPerSec = bench.fights_per_second || (1/avgFightS);
+    cpuCount = bench.cpu_count || cpuCount;
+    platformStr = bench.platform || "";
+  }
+  // curriculum makes early fights shorter (15-20s) ~0.75x, plus eval overhead ~1.1x
+  const estS = totalFights * avgFightS * 0.75 * 1.1 + gens * 2.0; // +2s per gen for eval/live replay
+  const benchInfo = bench ? `${(avgFightS*1000).toFixed(0)}ms/fight, ${fightsPerSec.toFixed(1)} fights/s, ${cpuCount} CPUs` : "no bench yet — using 50ms/fight fallback";
+  const sysInfo = bench ? `${cpuCount} CPUs · ${platformStr.split('-')[0] || ''} · ${benchInfo}` : `${cpuCount} CPUs (browser) · ${benchInfo}`;
+  $("estTime").innerHTML = `⏱ <b>${totalFights} fights</b> (${gens}×${pop}×${eps}) — est <b>${fmtTime(estS)}</b> on this machine (${benchInfo}). ` +
+    `Gunnery-focused: 40/30/30 base but curriculum 70/10/20→40/30/30→20/40/40 + opponent level→all + episode 15-20s→60-90s. ` +
+    `Prioritizes evals over length. <span class="dim">Longer max_time adds ~linear cost; more eps/pop is cheaper than longer fights for learning.</span>`;
+  $("sysSpecs").textContent = sysInfo;
+  const def = $("estDefault");
+  if (def) def.textContent = `~${fmtTime(16*24*8*0.05*0.75)} on this machine`;
 }
 
 function updateTrainUI(data) {
@@ -863,6 +907,11 @@ function bind() {
   if (toggle) {
     toggle.onclick = () => {
       $("trainBar").classList.toggle("hidden");
+      // when opening, refresh est time
+      if (!$("trainBar").classList.contains("hidden")) {
+        updateEstTime();
+        fetchBench().then(() => updateEstTime());
+      }
     };
   }
   const startBtn = $("startTrain");
@@ -871,6 +920,16 @@ function bind() {
   if (stopBtn) stopBtn.onclick = () => stopTraining();
   const watchBtn = $("watchLive");
   if (watchBtn) watchBtn.onclick = () => watchLive();
+
+  // estimated time — update on any training input change
+  const estInputs = ["trainGens", "trainPop", "trainEps", "trainPolicy", "trainBasis"];
+  for (const id of estInputs) {
+    const el = $(id);
+    if (el) {
+      el.addEventListener("input", () => updateEstTime());
+      el.addEventListener("change", () => updateEstTime());
+    }
+  }
 }
 
 bind();
@@ -881,6 +940,11 @@ loadManifest().catch((err) => {
 });
 requestAnimationFrame(frame);
 
+// initial bench + est time
+fetchBench().then(() => updateEstTime());
+updateEstTime();
+
 // start polling training status every 2s
 setInterval(pollTraining, 2000);
 setTimeout(pollTraining, 800);
+setInterval(() => { fetchBench().then(() => updateEstTime()); }, 15000);

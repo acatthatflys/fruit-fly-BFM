@@ -10,6 +10,14 @@ Design notes
   prevents "the agent" and "the opponent" from drifting into different physics.
 * Everything is deterministic given (scenario seed, action sequence), which is
   required for reproducible replays and for black-box optimisers like CEM/ES.
+
+Gunnery-focused tuning (2026-09):
+  - trigger discipline now distinguishes good (lead<=1.5° in WEZ) vs bad
+    (lead>10° spray) vs waste (out of WEZ)
+  - points decision weight 0.35→0.05 and requires damage to win on position
+    to close "win on points, cannot shoot" loophole
+  - observation vector fine channels now lead/2° and aa/2° (was /10 and /5)
+    giving 5x gain at 1° scale
 """
 from __future__ import annotations
 
@@ -163,10 +171,6 @@ class Dogfight:
             me.lead_angle = _lead_angle(me.s, other.s)
             me.in_wez = geo.in_wez(g)
             if me.los_dir_prev is not None and cfg.decision_dt > 0:
-                # rotation rate of the LOS vector, signed relative to the nose.
-                # This is the fly's lobula-plate-style "how fast is the target
-                # sliding across my eye" signal, and the damping term for the
-                # scripted steering law.
                 ang = vm.angle_between(me.los_dir_prev, g.azimuth_el)
                 axis = vm.cross(me.los_dir_prev, g.azimuth_el)
                 sign = -1.0 if vm.dot(axis, me.s.vel) > 0 else 1.0
@@ -201,10 +205,22 @@ class Dogfight:
 
         timeout = self.t >= cfg.max_time_s
 
-        # ---- trigger discipline: rounds sent outside the envelope are waste
+        # ---- trigger discipline + staying bonus: gunnery-focused
+        # good = trigger + in_wez + lead<=1.5° → reward
+        # bad  = trigger + lead>10° → small spray penalty (allow exploration)
+        # waste = trigger + not in_wez
+        # good_solution = in_wez + lead<=1.5° regardless of trigger → stay bonus
         for me, cmd in ((self.blue, cmd_blue), (self.red, cmd_red)):
-            if cmd.trigger and not me.in_wez:
-                events[me].trigger_waste += 1
+            la = abs(me.lead_angle)
+            if me.in_wez and la <= self.rc.good_lead_deg:
+                events[me].good_solution += 1
+            if cmd.trigger:
+                if not me.in_wez:
+                    events[me].trigger_waste += 1
+                if me.in_wez and la <= self.rc.good_lead_deg:
+                    events[me].good_trigger += 1
+                if la > self.rc.bad_lead_deg:
+                    events[me].bad_trigger += 1
 
         # ---- rewards
         rewards = {}
@@ -244,50 +260,74 @@ class Dogfight:
 
     # ---------------------------------------------------------------- helpers
     def _points_decision(self) -> str:
-        """Timeout = decision on points (BFM ruleset): damage, then position."""
+        """Timeout = decision on points (BFM ruleset): damage, then position.
+
+        Gunnery-focused fix (2026-09): previously 0.35 weight allowed winning
+        on position alone (nose-on, no hits) → "wins on points, cannot shoot".
+        Now 0.05 weight and requires damage advantage to win on position.
+        If damage equal, draw unless someone is decisively offensive.
+        """
         db = self.blue.hp - self.red.hp
-        pos_b = math.cos(math.radians(self.blue.geom_to_other.taa_deg))
-        pos_r = math.cos(math.radians(self.red.geom_to_other.taa_deg))
-        score = db + 0.35 * (pos_b - pos_r)
-        if abs(score) < 0.05:
-            return "draw"
-        return "blue" if score > 0 else "red"
+        # damage dominates — need actual hits to win
+        if abs(db) > 0.01:  # ~0.06 = 1 hit
+            # still add small position bonus
+            pos_b = math.cos(math.radians(self.blue.geom_to_other.taa_deg))
+            pos_r = math.cos(math.radians(self.red.geom_to_other.taa_deg))
+            score = db + 0.05 * (pos_b - pos_r)
+            if abs(score) < 0.02:
+                return "draw"
+            return "blue" if score > 0 else "red"
+        else:
+            # no damage — need decisive positional advantage to win, else draw
+            # prevents farming 74% win rate with 0 hits
+            pos_b = math.cos(math.radians(self.blue.geom_to_other.taa_deg))
+            pos_r = math.cos(math.radians(self.red.geom_to_other.taa_deg))
+            score = 0.05 * (pos_b - pos_r)
+            if abs(score) < 0.15:  # require >~25° TAA advantage
+                return "draw"
+            return "blue" if score > 0 else "red"
 
     def observe(self) -> Dict[str, tuple]:
         return {"blue": self.observation_vector(self.blue),
                 "red": self.observation_vector(self.red)}
 
     def observation_vector(self, me: Side) -> tuple:
-        """Hand-designed feature vector (used by the non-brain baselines)."""
+        """Hand-designed feature vector (used by the non-brain baselines).
+
+        Gunnery-focused tuning (2026-09):
+          - fine channels now lead/2° and aa/2° (was /10 and /5) giving 5x gain
+          - use tanh for fine so gradient beyond 3° still exists (was saturate)
+          - add lead AA (direction to ballistic lead point, not just magnitude)
+            so policy knows which way to pull for lead pursuit. This was the
+            missing piece: lead_angle magnitude alone cannot tell roll direction.
+          Now 20 dims (was 18): adds lead_aa/60 coarse and lead_aa/2 fine.
+        """
         other = self.red if me is self.blue else self.blue
         g = me.geom_to_other
         s = me.s
         de = math.tanh((s.specific_energy() - other.s.specific_energy()) / 1500.0)
+        lead_aa, lead_aa_vert = _lead_aa(me.s, other.s)
         return (
-            g.aa_deg / 60.0,                      # nose position, coarse
-            g.aa_vert_deg / 60.0,
-            math.cos(math.radians(g.taa_deg)),    # +1 offensive .. -1 defensive
-            g.hca_deg / 180.0,
-            min(g.range_m / 6000.0, 1.5),
-            math.tanh(g.closure_ms / 200.0),
-            me.los_rate_rad / 0.5,
-            # Fine nose error.  This slot used to be a 0.0 placeholder, which
-            # cost the linear policy the only thing that decides whether a round
-            # connects: at 600 m the nose has to be inside about a degree, and a
-            # feature that spans +-60 deg gives a linear policy a resolution of
-            # 1/60 near zero -- indistinguishable from noise once the weights are
-            # also being asked to fly the aircraft.
-            _saturate(g.aa_deg / 5.0),
-            s.v / 400.0,
-            s.gamma / math.radians(60.0),
-            math.sin(s.mu),
-            math.cos(s.mu),
-            s.n / 9.0,
-            s.throttle,
-            de,
-            _saturate(me.lead_angle / 10.0),      # ballistic lead error, fine
-            1.0 if me.in_wez else 0.0,
-            1.0 if geo.overshoot_flag(g) else 0.0,
+            g.aa_deg / 60.0,                      # 0 nose position, coarse
+            g.aa_vert_deg / 60.0,                 # 1
+            math.cos(math.radians(g.taa_deg)),    # 2 +1 offensive .. -1 defensive
+            g.hca_deg / 180.0,                    # 3
+            min(g.range_m / 6000.0, 1.5),         # 4
+            math.tanh(g.closure_ms / 200.0),      # 5
+            me.los_rate_rad / 0.5,                # 6
+            math.tanh(g.aa_deg / 2.0),            # 7 fine nose error, tanh not saturate
+            s.v / 400.0,                          # 8
+            s.gamma / math.radians(60.0),         # 9
+            math.sin(s.mu),                       # 10
+            math.cos(s.mu),                       # 11
+            s.n / 9.0,                            # 12
+            s.throttle,                           # 13
+            de,                                   # 14
+            math.tanh(me.lead_angle / 2.0),       # 15 ballistic lead error magnitude, fine
+            1.0 if me.in_wez else 0.0,            # 16
+            1.0 if geo.overshoot_flag(g) else 0.0,# 17
+            lead_aa / 60.0,                       # 18 lead AA coarse — direction to lead point
+            math.tanh(lead_aa / 2.0),             # 19 lead AA fine — tanh gives gradient beyond 3°
         )
 
     def info(self) -> dict:
@@ -382,6 +422,48 @@ def _lead_angle(me: State, other: State) -> float:
     return required_lead_angle_deg(me.pos, me.vel, other.pos, other.vel)
 
 
+def _lead_aa(me: State, other: State) -> tuple:
+    """AA to ballistic lead point (not to target). Returns (aa_deg, aa_vert_deg)
+    signed, similar to geometry.compute but for lead point.
+
+    This gives direction to pull for lead pursuit, which magnitude alone cannot.
+    """
+    from .gun import lead_solution
+    try:
+        lead_pt, _ = lead_solution(me.pos, me.vel, other.pos, other.vel)
+    except Exception:
+        return 0.0, 0.0
+    # vector to lead point
+    to_lead = vm.sub(lead_pt, me.pos)
+    if vm.norm(to_lead) < 1e-6:
+        return 0.0, 0.0
+    # own nose direction from psi, gamma
+    # State has psi, gamma in radians
+    try:
+        psi = me.psi
+        gamma = me.gamma
+    except Exception:
+        # fallback: use velocity direction
+        v_u = vm.unit(me.vel) if vm.norm(me.vel) > 1e-6 else (1.0, 0.0, 0.0)
+        # compute AA as angle between vel and to_lead
+        ang = vm.angle_between(v_u, vm.unit(to_lead))
+        return math.degrees(ang), 0.0
+
+    nose = (math.cos(psi) * math.cos(gamma),
+            math.sin(psi) * math.cos(gamma),
+            math.sin(gamma))
+    f = vm.unit(nose)
+    right = vm.right_of(f)
+    up = vm.up_of(f, right)
+    los_u = vm.unit(to_lead)
+    ang = vm.angle_between(f, los_u)
+    sign_h = 1.0 if vm.dot(los_u, right) >= 0 else -1.0
+    sign_v = 1.0 if vm.dot(los_u, up) >= 0 else -1.0
+    aa = math.degrees(ang) * sign_h
+    aa_vert = math.degrees(ang) * sign_v
+    return aa, aa_vert
+
+
 def _outside(s: State, cfg: EnvConfig):
     """Returns a reason string if the aircraft has left the fight, else None."""
     r = math.hypot(s.pos[0], s.pos[1])
@@ -426,7 +508,6 @@ def _brain_snapshot_from_policy(policy):
                 import warnings
                 warnings.warn(f"brain snapshot _groups() failed: {e}")
                 _brain_snapshot_warned = True
-            # return None to signal no brain, rather than empty dict that looks valid
             return None
 
         try:
@@ -496,7 +577,6 @@ def run_match(scen: Scenario, policy_blue, policy_red,
         cr = policy_red(vr, env)
         _, rewards, done, _ = env.step(cb, cr)
         trace.append(rewards["blue"])
-        # record brain snapshots into last frame if present
         if record and env.frames:
             try:
                 b_snap = _brain_snapshot_from_policy(policy_blue)

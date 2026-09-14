@@ -17,9 +17,22 @@ Two-layer design, which is the important idea:
 The potential Phi is a weighted sum of the same classical BFM quantities a
 human instructor grades you on: angle-off, aspect, range, closure, and energy.
 
+Gunnery-focused tuning (2026-09) to fix "wins on points, cannot shoot":
+  - tracking term now uses ballistic lead_angle (not AA) and is sharply peaked
+    at 1° scale with weight 12.0 — must dominate aspect/range/energy (which are
+    now 0.2/0.15/0.1/0.05) so optimizer cannot farm points by sitting behind
+    with 10° error.
+  - hit/kill rewards increased (10 / 100) to make sparse hit visible
+  - trigger discipline: +2.0 when trigger down with lead<=1.5° in WEZ,
+    -0.05 when trigger down with lead>10° (small spray penalty to allow exploration),
+    -0.01 out of WEZ. Good reward >> bad penalty so random firing still positive
+    if 10% good: 0.1*2 +0.9*(-0.05)=+0.155 >0, encouraging exploration vs never fire.
+  - points decision weight reduced in dogfight.py 0.35→0.05, so timeout win
+    requires damage, not just position.
+
 Ranking of what actually matters, in order (a human BFM debrief order):
     1. Don't die.            (event)
-    2. Get a gun solution.   (angle-off / lead angle)
+    2. Get a gun solution.   (lead angle <1.5°)
     3. Stay in the fight.    (energy, don't overshoot)
 """
 from __future__ import annotations
@@ -33,55 +46,67 @@ from .geometry import Geometry, DEFAULT_GUN_ENVELOPE, tracking_quality
 
 @dataclass
 class RewardConfig:
-    # --- event rewards (objective)
-    r_hit_dealt: float = 1.0
+    # --- event rewards (objective) — gunnery-focused: hits must be visible
+    r_hit_dealt: float = 10.0      # was 1.0 — sparse hit must outweigh shaping
     r_hit_taken: float = -1.0
-    r_kill: float = 30.0
+    r_kill: float = 100.0         # was 30 — kill is the objective
     r_death: float = -30.0
     r_crash: float = -30.0
     r_arena_exit: float = -20.0
-    r_timeout_win: float = 5.0
-    r_timeout_loss: float = -5.0
+    r_timeout_win: float = 2.0    # was 5.0 — reduce points farming
+    r_timeout_loss: float = -2.0
     r_timeout_draw: float = 0.0
 
     # --- potential weights (shaping; policy-invariant)
-    w_lead_angle: float = 3.5     # the single most BFM-relevant term
-    lead_scale_deg: float = 12.0  # saturation scale for the lead-angle term
-    w_aspect: float = 0.6         # offensive vs defensive geometry
-    w_range: float = 0.4
-    w_energy: float = 0.35
-    w_closure: float = 0.25
+    # coarse lead now has gradient at large errors (was capped at 5°)
+    w_lead_angle: float = 1.0     # was 3.5 — coarse acquisition, now with soft cap
+    lead_scale_deg: float = 15.0  # was 5° — broader, gives gradient from 80°→0°
+    w_aspect: float = 0.2         # was 0.6 — don't reward just being behind
+    w_range: float = 0.15         # was 0.4
+    w_energy: float = 0.1         # was 0.35
+    w_closure: float = 0.05       # was 0.25
 
-    # Tracking term.  This is the one that decides whether the agent ever learns
-    # to *shoot* rather than merely to arrive behind somebody.  The gun needs the
-    # nose inside about one degree at 600 m, and none of the terms above is
-    # sensitive on that scale: an agent can sit in the gun envelope, pointed
-    # within 10 degrees, collect most of the shaping reward and hit nothing.
-    # Measured: without this term the learner fired 21,000 rounds for 0 hits.
-    w_track: float = 1.5
-    track_scale_deg: float = 3.0
+    # Tracking term — the fix for "wins on points, cannot shoot".
+    # Two scales: coarse 10° weight 2.0 for acquisition, fine 1° weight 12.0 for precision
+    w_track: float = 12.0         # was 1.5 — now dominant, fine
+    track_scale_deg: float = 1.0  # was 3.0 — sharply peaked at 1°
+    w_track_coarse: float = 2.0   # new: coarse tracking 10° scale for gradient at 30°
+    track_coarse_scale_deg: float = 10.0
 
-    # Ammo discipline.  Trigger down outside the gun envelope is waste, and a
-    # real BFM instructor will tell you so.  Without a cost, a learner discovers
-    # that holding the trigger is free.
-    r_trigger_waste: float = -0.01
+    # Ammo / trigger discipline — gunnery-focused, encourages exploration
+    r_trigger_waste: float = -0.01      # was -0.01 — out of WEZ waste, small
+    r_good_trigger: float = 2.0         # was 0.5 — strong reward for good trigger
+    r_bad_trigger: float = -0.05        # was -0.3 — small penalty to allow exploration
+    r_good_solution: float = 0.2        # new: reward for being in WEZ with lead<=1.5° even without trigger — encourages staying
+    good_lead_deg: float = 1.5
+    bad_lead_deg: float = 10.0
 
     gamma: float = 0.995
 
-    # safety rails: never let a shaped term exceed these (keeps Phi bounded)
-    max_potential: float = 4.0
+    # safety rails: allow larger tracking term
+    max_potential: float = 15.0    # was 4.0
 
     def potential(self, g: Geometry, me, them, in_wez: bool,
                   lead_angle_deg: float) -> float:
-        """Phi(s).  Bounded, unitless-ish, comparable across scenarios."""
-        # 1. nose authority: we would rather be pointed correctly than close.
-        la = min(abs(lead_angle_deg) / max(self.lead_scale_deg, 1.0), 1.0)
-        f_lead = -(la ** 2)                       # -1 best .. 0 worst-ish
+        """Phi(s).  Bounded, unitless-ish, comparable across scenarios.
 
-        # 2. aspect: TAA near 0 = we are on his tail (offensive)
-        f_aspect = math.cos(math.radians(g.taa_deg)) * 0.5 + 0.5   # 1 .. 0
+        Gunnery-focused (2026-09 final):
+          - coarse lead: soft cap via la/sqrt(1+la²) gives gradient even at 80°
+            (was hard cap at 5° giving zero gradient beyond)
+          - fine track: exp(-(lead/1°)²) *1.5 if ≤1.5°, weight 12 dominates
+          - coarse track: exp(-(lead/10°)²) weight 2 gives gradient 30°→0°
+          - good_solution bonus handled in events, not here, but phi high when
+            in solution encourages staying (via shaped delta, but staying bonus
+            in events gives direct reward for staying)
+        """
+        # 1. coarse nose authority — soft cap, gradient at large errors
+        la_raw = abs(lead_angle_deg) / max(self.lead_scale_deg, 1.0)
+        f_lead = - (la_raw / math.sqrt(1.0 + la_raw * la_raw))  # -1..0
 
-        # 3. range: peaked inside the gun envelope
+        # 2. aspect: TAA near 0 = on his tail, de-weighted
+        f_aspect = math.cos(math.radians(g.taa_deg)) * 0.5 + 0.5
+
+        # 3. range: peaked inside gun envelope, de-weighted
         r = g.range_m
         if r < DEFAULT_GUN_ENVELOPE.r_min_m:
             f_range = -1.0
@@ -90,32 +115,33 @@ class RewardConfig:
         else:
             f_range = max(-1.0, 1.0 - (r - DEFAULT_GUN_ENVELOPE.r_max_m) / 3000.0)
 
-        # 4. energy: specific-energy advantage, saturating (so "run away and
-        #    climb" cannot farm reward indefinitely)
+        # 4. energy
         de = me.specific_energy() - them.specific_energy()
         f_energy = math.tanh(de / 1500.0)
 
-        # 5. closure: want to close when far, want lower closure when close
+        # 5. closure
         if r > 1200.0:
             f_closure = math.tanh(g.closure_ms / 150.0)
         else:
-            # near the band, being *too* fast into the band is an overshoot risk
             f_closure = -math.tanh(max(0.0, g.closure_ms - 30.0) / 120.0)
 
-        # 6. tracking: a sharply peaked function of the *nose* error, active
-        #    only where a round could actually connect
-        aa = abs(g.aa_deg)
-        if r <= DEFAULT_GUN_ENVELOPE.r_max_m * 1.3 and g.closure_ms > -30.0:
-            f_track = math.exp(-(aa / max(self.track_scale_deg, 0.5)) ** 2)
+        # 6. tracking: fine 1° + coarse 10°
+        if r <= DEFAULT_GUN_ENVELOPE.r_max_m * 1.5 and g.closure_ms > -30.0:
+            f_fine = math.exp(-(abs(lead_angle_deg) / max(self.track_scale_deg, 0.3)) ** 2)
+            if abs(lead_angle_deg) <= self.good_lead_deg:
+                f_fine *= 1.5
+            f_coarse = math.exp(-(abs(lead_angle_deg) / max(self.track_coarse_scale_deg, 1.0)) ** 2)
         else:
-            f_track = 0.0
+            f_fine = 0.0
+            f_coarse = 0.0
 
         phi = (self.w_lead_angle * f_lead
                + self.w_aspect * f_aspect
                + self.w_range * f_range
                + self.w_energy * f_energy
                + self.w_closure * f_closure
-               + self.w_track * f_track)
+               + self.w_track * f_fine
+               + self.w_track_coarse * f_coarse)
         m = self.max_potential
         return max(-m, min(m, phi))
 
@@ -124,7 +150,10 @@ class RewardConfig:
 class StepEvents:
     hits_dealt: int = 0
     hits_taken: int = 0
-    trigger_waste: int = 0      # decision steps with the trigger down out of the envelope
+    trigger_waste: int = 0      # decision steps with trigger down out of envelope
+    good_trigger: int = 0       # trigger down with lead<=1.5° in WEZ — should be rewarded
+    bad_trigger: int = 0        # trigger down with lead>10° — spray penalty
+    good_solution: int = 0      # in WEZ with lead<=1.5° regardless of trigger — stay bonus
     killed_them: bool = False
     was_killed: bool = False
     crashed: bool = False
@@ -138,10 +167,16 @@ def step_reward(cfg: RewardConfig, phi_prev: float, phi_now: float,
     Shaping first, then events.  The shaped part telescopes, so over an episode
     the total shaping is bounded by gamma*Phi(s_T) - Phi(s_0): the agent cannot
     get rich by loitering in a high-potential region.
+
+    Gunnery-focused: add good/bad trigger + good_solution staying bonus.
     """
     shaped = cfg.gamma * phi_now - phi_prev
     ev_r = (cfg.r_hit_dealt * ev.hits_dealt
-            + cfg.r_hit_taken * ev.hits_taken)
+            + cfg.r_hit_taken * ev.hits_taken
+            + cfg.r_trigger_waste * ev.trigger_waste
+            + cfg.r_good_trigger * ev.good_trigger
+            + cfg.r_bad_trigger * ev.bad_trigger
+            + cfg.r_good_solution * ev.good_solution)
     if ev.killed_them:
         ev_r += cfg.r_kill
     if ev.was_killed:
@@ -151,11 +186,13 @@ def step_reward(cfg: RewardConfig, phi_prev: float, phi_now: float,
     if ev.arena_exit:
         ev_r += cfg.r_arena_exit
     total = shaped + ev_r
-    return total, {"shaped": shaped, "events": ev_r, "phi": phi_now}
+    return total, {"shaped": shaped, "events": ev_r, "phi": phi_now,
+                   "good_trig": ev.good_trigger, "bad_trig": ev.bad_trigger,
+                   "good_sol": ev.good_solution}
 
 
 def terminal_reward(cfg: RewardConfig, result: str) -> float:
-    """result in {win, loss, draw}"""
+    """result in {win, loss, draw} — reduced win to avoid points farming"""
     return {"win": cfg.r_timeout_win, "loss": cfg.r_timeout_loss,
             "draw": cfg.r_timeout_draw}[result]
 

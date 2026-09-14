@@ -133,10 +133,11 @@ class ConnectomeController:
         self.sensors = SensorBank(self.conn, sensor_cfg)
         self.readout = readout or ReadoutParams()
         self.da = DopamineChannel(self.conn, da_cfg)
-        self.critic = LinearCritic(n_features=18, lr=(da_cfg or DopamineConfig()).critic_lr,
+        # observation now 20 dims (was 18) — gunnery-focused adds lead AA direction
+        self.critic = LinearCritic(n_features=20, lr=(da_cfg or DopamineConfig()).critic_lr,
                                    gamma=(da_cfg or DopamineConfig()).gamma)
         self.plasticity = plasticity
-        self._phi = [0.0] * 18
+        self._phi = [0.0] * 20
         self._rate = (lif_params or LIFParams(dt=0.002)).dt
         self.stats: Dict[str, float] = {"brain_steps": 0.0, "spikes": 0.0,
                                         "da_total": 0.0, "plastic_updates": 0.0}
@@ -244,7 +245,7 @@ class ConnectomeController:
     def reset(self):
         self.critic.reset()
         self.net.clear_inputs()
-        self._phi = [0.0] * 18
+        self._phi = [0.0] * 20
 
     # ---------------------------------------------------------------- reporting
     def describe(self) -> dict:

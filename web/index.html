@@ -28,7 +28,7 @@
   <div class="trainbar-row">
     <label>policy <select id="trainPolicy"><option value="features" selected>features (poly)</option><option value="brain">brain</option></select></label>
     <label>basis <select id="trainBasis"><option value="poly" selected>poly</option><option value="linear">linear</option></select></label>
-    <label>gens <input id="trainGens" type="number" min="1" max="100" value="12" style="width:56px"></label>
+    <label>gens <input id="trainGens" type="number" min="1" max="100" value="16" style="width:56px"></label>
     <label>pop <input id="trainPop" type="number" min="2" max="100" value="24" style="width:56px"></label>
     <label>ep/cand <input id="trainEps" type="number" min="1" max="32" value="8" style="width:56px"></label>
     <label>seed <input id="trainSeed" type="number" value="0" style="width:56px"></label>
@@ -42,10 +42,15 @@
     <button id="watchLive" class="ghost">👁 watch live fly</button>
   </div>
   <div class="trainbar-row small mono">
-    <span id="trainDetail">defaults: 12 gens × 24 pop × 8 eps = 2304 fights, 40% easy gunnery (250-900m ±30°), 30% defensive (defensive/topgun_break jitter), 30% random, curriculum 15-20s→30-45s→60-90s. Prioritizes evaluations over length.</span>
+    <span id="trainDetail">gunnery-focused defaults: 16 gens × 24 pop × 8 eps = 3072 fights (20d obs: lead AA direction + tanh fine), 40% easy (250-500m ±15° half + 250-900m ±30°), 30% defensive (defensive/topgun_break jitter), 30% random, curriculum: episode 15-20s→30-45s→60-90s + scenario 70/10/20→40/30/30→20/40/40 + opponent level→all, reward: tracking lead 1° weight 12.0 + coarse 10° weight 2.0 dominates (soft cap gives gradient at 80°), hit 10 kill 100, good trigger +2.0 bad -0.05, good_solution +0.2 stay bonus, points 0.05, imitation 70/10/20 guns. Prioritizes evals over length.</span>
+  </div>
+  <div class="trainbar-row small mono" id="estRow" style="background:rgba(77,163,255,0.08); border:1px solid #1b2735; border-radius:6px; padding:6px 8px;">
+    <span id="estTime">⏱ estimating… — run <span class="mono">flybfm serve</span> to bench this machine. Default 3072 fights ≈ <span id="estDefault">~3-5 min on laptop</span> (50ms/fight). Prioritizes evaluations over length.</span>
+    <span class="spacer"></span>
+    <span id="sysSpecs" class="dim"></span>
   </div>
   <div class="trainbar-row">
-    <div class="logbox mono" id="trainLog">no log yet — start training in terminal: <span class="mono">python -m flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> then serve</div>
+    <div class="logbox mono" id="trainLog">no log yet — start training in terminal: <span class="mono">python -m flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> then serve. Closing window doesn't kill training; viewer shows live match of random training fly + best result.</div>
   </div>
 </div>
 
@@ -94,8 +99,8 @@
     <h3>manoeuvres</h3>
     <div id="manoeuvres" class="small"></div>
 
-    <h3>training progress</h3>
-    <div id="trainProgress" class="small mono">no training running. Start via terminal or button above.</div>
+    <h3>training progress — best result</h3>
+    <div id="trainProgress" class="small mono">no training running. Start via terminal or button above. Best result will auto-show here + in 3D view when training finishes.</div>
 
     <h3>events</h3>
     <ol id="events" class="events mono"></ol>
@@ -103,7 +108,7 @@
     <p class="foot">
       Frames are recorded at <span id="rate" class="mono">—</span>. Drag on the view
       to orbit, wheel to zoom, click the timeline to scrub.<br>
-      <span class="dim">Tip: run <span class="mono">flybfm serve</span> then <span class="mono">flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> in another terminal. Closing window doesn't kill training; viewer shows live match of a random training fly.</span>
+      <span class="dim">Tip: run <span class="mono">flybfm serve</span> then <span class="mono">flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> in another terminal. Closing window doesn't kill training; viewer shows live match. Gunnery fix: 20d obs lead AA direction + tanh fine, tracking 1° weight 12 + coarse 10° weight 2 dominates with soft cap gradient at 80°, hit 10 kill 100, good trigger +2 bad -0.05 good_solution +0.2 stay, points 0.05. Est time bench 6 fights.</span>
     </p>
   </aside>
 </main>
