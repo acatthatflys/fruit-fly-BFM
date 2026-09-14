@@ -8,7 +8,13 @@
  * Extra panels:
  *  - brainView: population rates per group (and per-type when full CNS)
  *  - flyView: stick & throttle cartoon driven by DN readout
+ *
+ * Live training extension (2026-09):
+ *  - polls /api/train/status, /api/train/log, /api/train/live
+ *  - training runs in terminal (server subprocess), survives window close
+ *  - while training, viewer shows live match of a random fly in training
  */
+
 "use strict";
 
 const COL = { blue: "#4da3ff", red: "#ff5d5d", amber: "#ffc857", green: "#5ddc8a", dim: "#7b8a9c", cyan: "#5de0ff", magenta: "#ff7ac0" };
@@ -18,6 +24,8 @@ const state = {
   manifest: null, replay: null, frames: [], t: 0, dur: 1, playing: true, speed: 1,
   cam: { yaw: -0.9, pitch: 0.42, dist: 2600, mode: "chase-blue", target: [0, 0, 4000] },
   lastTS: 0, drag: null, strip: null,
+  liveGen: -1,
+  training: { running: false, pid: null, status: null },
 };
 
 // ---------------------------------------------------------------- utilities
@@ -256,7 +264,7 @@ function updatePanel(s) {
   $("commands").innerHTML =
     cmdBar("roll", c[0], -1, 1) + cmdBar("pull", c[1], -1, 1) +
     cmdBar("throttle", c[2], 0, 1) +
-    `<div class="cmdrow"><span>trigger</span><div class="bar"><span style="left:0;width:${c[3] ? 100 : 0}%\"></span></div>
+    `<div class="cmdrow"><span>trigger</span><div class="bar"><span style="left:0;width:${c[3] ? 100 : 0}%\\"></span></div>
       <span style="text-align:right">${c[3] ? "FIRE" : "safe"}</span></div>`;
 
   const g = s.g || {};
@@ -299,12 +307,10 @@ function drawBrainView(s) {
   const hasBrain = !!brain;
   $("brainMeta").textContent = hasBrain ? `${fmt(brain.population_hz,2)} Hz pop · ${brain.spikes_last} spikes` : "no brain field — run --blue brain";
 
-  // layout: left side groups, right side per-type if full CNS
   const groups = hasBrain ? brain.groups : null;
   const perType = hasBrain ? brain.per_type : null;
 
   if (!hasBrain) {
-    // placeholder: show command-derived pseudo rates
     const c = s.b.cmd || [0,0,0,false];
     const roll = c[0], pull = c[1], thr = c[2];
     const pseudo = [
@@ -320,7 +326,6 @@ function drawBrainView(s) {
     return;
   }
 
-  // real brain data
   const order = ["turn_left","turn_right","vis_left","vis_right","pitch_up","pitch_down","speed","trigger"];
   const bars = [];
   for (const k of order) {
@@ -335,13 +340,11 @@ function drawBrainView(s) {
       bars.push({ label: k, value: groups[k], color: col });
     }
   }
-  // add a few extra groups if present
   const extra = Object.keys(groups || {}).filter(k=>!order.includes(k)).slice(0,4);
   for (const k of extra) bars.push({ label: k, value: groups[k], color: COL.dim });
 
   drawBarGroup(ctx, w, h, bars, "DN + STMD groups");
 
-  // per-type legend for full CNS
   if (perType && Object.keys(perType).length) {
     const top = Object.entries(perType).sort((a,b)=>b[1]-a[1]).slice(0,10);
     $("brainLegend").innerHTML = top.map(([t,v])=>`<span style="color:${COL.blue}">${t}</span> ${fmt(v,2)}Hz`).join(" · ");
@@ -360,17 +363,13 @@ function drawBarGroup(ctx, w, h, bars, title) {
     const y = pad+16 + i*(barH+gap);
     const x0 = pad+labelW;
     const bw = (w - x0 - pad) * (Math.abs(b.value)/maxV);
-    // label
     ctx.fillStyle = "#7b8a9c"; ctx.textAlign="right";
     ctx.fillText(b.label, x0-6, y+barH*0.6);
     ctx.textAlign="left";
-    // bar bg
     ctx.fillStyle = "rgba(22,32,43,0.9)";
     ctx.fillRect(x0, y, w - x0 - pad, barH);
-    // bar fg
     ctx.fillStyle = b.color;
     ctx.fillRect(x0, y, bw, barH);
-    // value
     ctx.fillStyle = "#cfd8e3"; ctx.font = "10px ui-monospace, monospace";
     ctx.fillText(fmt(b.value,2), x0 + bw + 4, y+barH*0.6);
   });
@@ -393,54 +392,36 @@ function drawFlyView(s) {
 
   $("flyMeta").textContent = `${roll>=0?'roll right':'roll left'} ${fmt(Math.abs(roll),2)} · ${pull>=0?'pull up':'push down'} ${fmt(Math.abs(pull),2)} · thr ${fmt(thr,2)} ${trig?'· FIRE':''}`;
 
-  // background
   ctx.fillStyle = "#0e141c"; ctx.fillRect(0,0,w,h);
-  // grid
   ctx.strokeStyle = "rgba(60,84,116,.25)"; ctx.lineWidth=1;
   for (let i=0;i<=4;i++){ const x = w*0.15 + i*(w*0.5/4); ctx.beginPath(); ctx.moveTo(x, h*0.1); ctx.lineTo(x, h*0.85); ctx.stroke(); }
   for (let i=0;i<=4;i++){ const y = h*0.1 + i*(h*0.75/4); ctx.beginPath(); ctx.moveTo(w*0.15, y); ctx.lineTo(w*0.65, y); ctx.stroke(); }
 
-  // stick base
   const cx = w*0.4, cy = h*0.5;
   const range = 60;
   const sx = cx + roll*range;
-  const sy = cy - pull*range; // pull up = stick back = up on screen? invert: pull up = stick back (down in our coord) — use intuitive: pull up = stick down? Let's keep up = pull up
-  // Actually typical stick: pull back = nose up. We'll map pull>0 to sy lower (toward pilot)
   const sy2 = cy + pull*range*0.6;
 
-  // base circle
   ctx.fillStyle = "#16202b"; ctx.beginPath(); ctx.arc(cx, cy, 70, 0, Math.PI*2); ctx.fill();
   ctx.strokeStyle = "#22303f"; ctx.lineWidth=2; ctx.stroke();
-
-  // cross
   ctx.strokeStyle = "rgba(123,138,156,.3)"; ctx.beginPath(); ctx.moveTo(cx-70, cy); ctx.lineTo(cx+70, cy); ctx.moveTo(cx, cy-70); ctx.lineTo(cx, cy+70); ctx.stroke();
-
-  // stick shaft
   ctx.strokeStyle = "#4da3ff"; ctx.lineWidth=4; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(sx, sy2); ctx.stroke();
-
-  // stick top
   ctx.fillStyle = trig ? "#ff5d5d" : "#4da3ff"; ctx.beginPath(); ctx.arc(sx, sy2, 12, 0, Math.PI*2); ctx.fill();
   ctx.strokeStyle = "#0a0f15"; ctx.lineWidth=2; ctx.stroke();
 
-  // fly avatar — simple top-down fly with wings that flap with throttle
   const fx = w*0.82, fy = h*0.45;
   const flap = Math.sin(Date.now()*0.02 * (0.5 + thr*2)) * (10 + thr*15);
   ctx.save(); ctx.translate(fx, fy);
-  // body
   ctx.fillStyle = "#cfd8e3"; ctx.beginPath(); ctx.ellipse(0,0, 10, 22, 0,0,Math.PI*2); ctx.fill();
-  // head
   ctx.fillStyle = "#ff5d5d"; ctx.beginPath(); ctx.arc(0, -18, 6, 0, Math.PI*2); ctx.fill();
-  // wings
   ctx.fillStyle = "rgba(93,220,138,.7)";
   ctx.beginPath(); ctx.ellipse(-14, 2, 18, 6, -0.3 + flap*0.02, 0, Math.PI*2); ctx.fill();
   ctx.beginPath(); ctx.ellipse(14, 2, 18, 6, 0.3 - flap*0.02, 0, Math.PI*2); ctx.fill();
-  // arms on stick — lines from fly to stick
   ctx.strokeStyle = "#7b8a9c"; ctx.lineWidth=2;
   ctx.beginPath(); ctx.moveTo(-4, -6); ctx.lineTo(cx - fx + (sx-cx)*0.3, cy - fy + (sy2-cy)*0.3); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(4, -6); ctx.lineTo(cx - fx + (sx-cx)*0.7, cy - fy + (sy2-cy)*0.7); ctx.stroke();
   ctx.restore();
 
-  // throttle lever
   const tx = w*0.92, ty0 = h*0.15, ty1 = h*0.85;
   ctx.fillStyle = "#16202b"; ctx.fillRect(tx-8, ty0, 16, ty1-ty0);
   ctx.strokeStyle = "#22303f"; ctx.strokeRect(tx-8, ty0, 16, ty1-ty0);
@@ -449,7 +430,6 @@ function drawFlyView(s) {
   ctx.fillStyle = "#7b8a9c"; ctx.font="10px ui-monospace, monospace"; ctx.fillText("THR", tx-14, ty0-6);
   ctx.fillText(fmt(thr*100,0)+"%", tx-16, ty1+12);
 
-  // status text
   const status = [];
   if (Math.abs(roll)>0.1) status.push(roll>0?"→ rolling right":"← rolling left");
   else status.push("→ wings level");
@@ -567,7 +547,6 @@ function frame(ts) {
     drawStripPlayhead();
     drawBrainView(s);
     drawFlyView(s);
-    // clock
     $("clock").textContent = fmt(s.t,1)+"s / "+fmt(state.dur,1)+"s";
   }
   requestAnimationFrame(frame);
@@ -589,6 +568,10 @@ async function loadManifest() {
 async function loadReplay(file) {
   const res = await fetch("replays/" + file, { cache: "no-store" });
   const rp = await res.json();
+  await loadReplayData(rp);
+}
+
+async function loadReplayData(rp) {
   state.replay = rp;
   state.frames = rp.frames || [];
   state.dur = (state.frames.length ? state.frames[state.frames.length - 1].t : 1) || 1;
@@ -609,6 +592,165 @@ async function loadReplay(file) {
   $("rate").textContent = `${fmt(rate, 2)} s (${state.frames.length} frames)`;
   buildStrip();
   setPlaying(true);
+  // show live badge if this is a live replay
+  if (rp.generation !== undefined) {
+    $("liveBadge").classList.remove("hidden");
+    $("liveBadge").textContent = `LIVE gen ${rp.generation} · ${rp.blue_name || "fly"} vs ${rp.red_name || "opp"} · ${rc}`;
+  } else {
+    $("liveBadge").classList.add("hidden");
+  }
+}
+
+// -------------------------------------------------------------- live training
+async function fetchTrainStatus() {
+  try {
+    const res = await fetch("/api/train/status", { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+async function fetchTrainLog() {
+  try {
+    const res = await fetch("/api/train/log?lines=120", { cache: "no-store" });
+    if (!res.ok) return null;
+    const j = await res.json();
+    return j.log || "";
+  } catch { return null; }
+}
+async function fetchLiveReplay() {
+  try {
+    const res = await fetch("/api/train/live", { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+function updateTrainUI(data) {
+  if (!data) {
+    $("trainStatus").textContent = "idle (no server or no training)";
+    $("trainStatus").className = "trainbar-status mono";
+    return;
+  }
+  state.training = data;
+  const running = data.running;
+  const st = data.status || {};
+  const gen = st.generation;
+  const total = st.total_generations || "?";
+  const best = st.best_return;
+  const mean = st.mean_return;
+  if (running) {
+    $("trainStatus").textContent = `running pid ${data.pid} — gen ${gen !== undefined ? gen : "?"} / ${total} best ${best !== undefined ? best.toFixed(1) : "?"} mean ${mean !== undefined ? mean.toFixed(1) : "?"}`;
+    $("trainStatus").className = "trainbar-status mono running";
+  } else {
+    if (st && st.generation !== undefined) {
+      $("trainStatus").textContent = `stopped — last gen ${gen} / ${total} best ${fmt(best,1)} — click watch live to see best result`;
+    } else {
+      $("trainStatus").textContent = "idle — no training running";
+    }
+    $("trainStatus").className = "trainbar-status mono";
+  }
+  // progress panel
+  if (st && st.history) {
+    const hist = st.history.slice(-8);
+    const lines = hist.map(h => {
+      const ev = h.eval ? ` win ${(h.eval.win_rate*100).toFixed(0)}% hit ${(h.eval.hit_rate*100).toFixed(1)}%` : "";
+      return `gen ${h.generation} best ${fmt(h.best_return,1)} mean ${fmt(h.mean_return,1)} ${h.max_time_s ? h.max_time_s.toFixed(0)+'s' : ''}${ev}`;
+    }).join("\n");
+    const poolLines = (st.pool || []).slice(0,4).map(r => `${r.name}: ${r.learner_wins}W ${r.opponent_wins}L`).join(" · ");
+    $("trainProgress").innerHTML = `<b>gen ${st.generation}/${st.total_generations || "?"}</b> best ${fmt(st.best_return,2)} mean ${fmt(st.mean_return,2)}<br>` +
+      (st.eval ? `eval win ${fmt(st.eval.win_rate*100,0)}% loss ${fmt(st.eval.loss_rate*100,0)}% hit ${fmt(st.eval.hit_rate*100,1)}%<br>` : "") +
+      `<span class="dim">${lines.replace(/\n/g,"<br>")}</span>` +
+      (poolLines ? `<br><span class="dim">${poolLines}</span>` : "");
+  }
+}
+
+async function pollTraining() {
+  const status = await fetchTrainStatus();
+  updateTrainUI(status);
+  const log = await fetchTrainLog();
+  if (log !== null && log.length) {
+    $("trainLog").textContent = log;
+    // auto scroll to bottom
+    $("trainLog").scrollTop = $("trainLog").scrollHeight;
+  }
+  // if training running and live replay newer than current, auto-load
+  if (status && status.running) {
+    const live = await fetchLiveReplay();
+    if (live && live.generation !== undefined && live.generation !== state.liveGen) {
+      // only auto-switch if user clicked watch live before or if we are already showing live
+      if (state.autoWatchLive || state.replay && state.replay.generation !== undefined) {
+        state.liveGen = live.generation;
+        await loadReplayData(live);
+      } else {
+        // just update badge count but don't steal user's replay
+        state.liveGen = live.generation;
+        // show hint
+        $("liveBadge").classList.remove("hidden");
+        $("liveBadge").textContent = `LIVE gen ${live.generation} available — click 👁 watch live fly`;
+      }
+    }
+  }
+}
+
+async function startTraining() {
+  const cfg = {
+    policy: $("trainPolicy").value,
+    basis: $("trainBasis").value,
+    generations: parseInt($("trainGens").value, 10),
+    population: parseInt($("trainPop").value, 10),
+    episodes: parseInt($("trainEps").value, 10),
+    seed: parseInt($("trainSeed").value, 10),
+    easy_frac: parseInt($("trainEasy").value, 10) / 100.0,
+    defensive_frac: parseInt($("trainDef").value, 10) / 100.0,
+    random_frac: parseInt($("trainRand").value, 10) / 100.0,
+    no_curriculum: $("trainNoCurr").checked,
+  };
+  // normalize fracs
+  const tot = cfg.easy_frac + cfg.defensive_frac + cfg.random_frac;
+  if (tot > 0) {
+    cfg.easy_frac /= tot; cfg.defensive_frac /= tot; cfg.random_frac /= tot;
+  }
+  $("trainLog").textContent = `starting training: ${JSON.stringify(cfg, null, 2)}\n...`;
+  try {
+    const res = await fetch("/api/train/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    });
+    const j = await res.json();
+    if (!res.ok) {
+      $("trainLog").textContent = `failed to start: ${j.error || res.statusText}\n${JSON.stringify(j, null, 2)}`;
+    } else {
+      $("trainLog").textContent = `started pid ${j.pid}\ncmd: ${j.cmd}\nlog: ${j.log}\nlive replay: ${j.live_replay}\n\nThis process runs in the terminal (server process), not in the browser thread. Closing the window doesn't kill it. The viewer will show live matches while training.`;
+      state.autoWatchLive = true;
+      // immediate poll
+      setTimeout(pollTraining, 1000);
+    }
+  } catch (e) {
+    $("trainLog").textContent = `error: ${e}\n\nIf you are opening file:// directly, the API won't work. Run:\n  python -m flybfm serve --port 8000\nand open http://localhost:8000\n\nOr start training in terminal:\n  python -m flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json --generations ${cfg.generations} --population ${cfg.population} --episodes ${cfg.episodes}`;
+  }
+}
+
+async function stopTraining() {
+  try {
+    const res = await fetch("/api/train/stop", { method: "POST" });
+    const j = await res.json();
+    $("trainLog").textContent = `stop result: ${JSON.stringify(j, null, 2)}\n${$("trainLog").textContent}`;
+    setTimeout(pollTraining, 500);
+  } catch (e) {
+    $("trainLog").textContent = `stop error: ${e}`;
+  }
+}
+
+async function watchLive() {
+  state.autoWatchLive = true;
+  const live = await fetchLiveReplay();
+  if (!live) {
+    $("trainLog").textContent = "no live replay yet — training hasn't written one, or not running. Check /api/train/status and log.";
+    return;
+  }
+  state.liveGen = live.generation;
+  await loadReplayData(live);
 }
 
 // -------------------------------------------------------------------- events
@@ -616,7 +758,7 @@ function bind() {
   $("play").onclick = () => setPlaying(!state.playing);
   $("speed").onchange = (e) => { state.speed = parseFloat(e.target.value); };
   $("cam").onchange = (e) => { state.cam.mode = e.target.value; };
-  $("replaySel").onchange = (e) => loadReplay(e.target.value);
+  $("replaySel").onchange = (e) => { state.autoWatchLive = false; loadReplay(e.target.value); };
   $("reload").onclick = () => loadManifest().catch((err) => console.error(err));
   $("scrub").oninput = (e) => {
     state.t = (parseFloat(e.target.value) / 1000) * state.dur;
@@ -643,6 +785,20 @@ function bind() {
     state.cam.dist = clamp(state.cam.dist * (1 + Math.sign(e.deltaY) * 0.12), 300, 30000);
   }, { passive: false });
   window.addEventListener("resize", () => { if (state.replay) buildStrip(); });
+
+  // training controls
+  const toggle = $("toggleTrain");
+  if (toggle) {
+    toggle.onclick = () => {
+      $("trainBar").classList.toggle("hidden");
+    };
+  }
+  const startBtn = $("startTrain");
+  if (startBtn) startBtn.onclick = () => startTraining();
+  const stopBtn = $("stopTrain");
+  if (stopBtn) stopBtn.onclick = () => stopTraining();
+  const watchBtn = $("watchLive");
+  if (watchBtn) watchBtn.onclick = () => watchLive();
 }
 
 bind();
@@ -652,3 +808,7 @@ loadManifest().catch((err) => {
   console.error(err);
 });
 requestAnimationFrame(frame);
+
+// start polling training status every 2s
+setInterval(pollTraining, 2000);
+setTimeout(pollTraining, 800);

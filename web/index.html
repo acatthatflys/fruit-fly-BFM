@@ -16,13 +16,44 @@
   <div class="pickers">
     <select id="replaySel" title="replay"></select>
     <button id="reload" class="ghost" title="reload manifest">↻</button>
+    <button id="toggleTrain" class="ghost" title="training controls">⚙ train</button>
   </div>
 </header>
+
+<div id="trainBar" class="trainbar hidden">
+  <div class="trainbar-row">
+    <div class="trainbar-title">live training — runs in terminal, survives window close</div>
+    <div class="trainbar-status mono" id="trainStatus">idle</div>
+  </div>
+  <div class="trainbar-row">
+    <label>policy <select id="trainPolicy"><option value="features" selected>features (poly)</option><option value="brain">brain</option></select></label>
+    <label>basis <select id="trainBasis"><option value="poly" selected>poly</option><option value="linear">linear</option></select></label>
+    <label>gens <input id="trainGens" type="number" min="1" max="100" value="12" style="width:56px"></label>
+    <label>pop <input id="trainPop" type="number" min="2" max="100" value="24" style="width:56px"></label>
+    <label>ep/cand <input id="trainEps" type="number" min="1" max="32" value="8" style="width:56px"></label>
+    <label>seed <input id="trainSeed" type="number" value="0" style="width:56px"></label>
+    <label>easy% <input id="trainEasy" type="number" min="0" max="100" value="40" style="width:48px"></label>
+    <label>def% <input id="trainDef" type="number" min="0" max="100" value="30" style="width:48px"></label>
+    <label>rand% <input id="trainRand" type="number" min="0" max="100" value="30" style="width:48px"></label>
+    <label><input id="trainNoCurr" type="checkbox"> no curriculum</label>
+    <span class="spacer"></span>
+    <button id="startTrain">▶ start training</button>
+    <button id="stopTrain" class="ghost">■ stop</button>
+    <button id="watchLive" class="ghost">👁 watch live fly</button>
+  </div>
+  <div class="trainbar-row small mono">
+    <span id="trainDetail">defaults: 12 gens × 24 pop × 8 eps = 2304 fights, 40% easy gunnery (250-900m ±30°), 30% defensive (defensive/topgun_break jitter), 30% random, curriculum 15-20s→30-45s→60-90s. Prioritizes evaluations over length.</span>
+  </div>
+  <div class="trainbar-row">
+    <div class="logbox mono" id="trainLog">no log yet — start training in terminal: <span class="mono">python -m flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> then serve</div>
+  </div>
+</div>
 
 <main>
   <section class="stage">
     <canvas id="view"></canvas>
     <div id="hud" class="hud"></div>
+    <div id="liveBadge" class="livebadge hidden">LIVE gen —</div>
     <div class="stagebar">
       <button id="play">⏸</button>
       <input type="range" id="scrub" min="0" max="1000" value="0">
@@ -63,12 +94,16 @@
     <h3>manoeuvres</h3>
     <div id="manoeuvres" class="small"></div>
 
+    <h3>training progress</h3>
+    <div id="trainProgress" class="small mono">no training running. Start via terminal or button above.</div>
+
     <h3>events</h3>
     <ol id="events" class="events mono"></ol>
 
     <p class="foot">
       Frames are recorded at <span id="rate" class="mono">—</span>. Drag on the view
-      to orbit, wheel to zoom, click the timeline to scrub.
+      to orbit, wheel to zoom, click the timeline to scrub.<br>
+      <span class="dim">Tip: run <span class="mono">flybfm serve</span> then <span class="mono">flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> in another terminal. Closing window doesn't kill training; viewer shows live match of a random training fly.</span>
     </p>
   </aside>
 </main>

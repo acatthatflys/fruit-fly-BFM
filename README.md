@@ -43,7 +43,7 @@ pip install -e ".[dev]"                        # all + neuprint-python
 - GitHub Actions runs `python -m unittest discover -s tests` on every push (see `.github/workflows/ci.yml`).
 - `load_malecns_flat` column-sniffing has a regression test with a tiny synthetic `.feather` fixture (`tests/test_connectome_loader.py`), because column names move between MaleCNS releases (flagged in `DATA.md`).
 
-## Viewer — 3 windows
+## Viewer — 3 windows + live training
 
 `python -m flybfm serve --dir web --port 8000` → http://localhost:8000/
 
@@ -52,6 +52,15 @@ pip install -e ".[dev]"                        # all + neuprint-python
 - **Middle-right: fly stick & throttle** — cartoon fly manipulating stick based on actual DN output: stick X = roll (`turn_gain*(R−L + vis_gain*STMD_R−L)`), Y = pull (`pitch_up−down`), throttle lever = throttle, trigger button. Linked to what the fly brain is actually doing (pulling up, rolling right, etc.). Fly wings flap with throttle.
 
 Replays with brain: `python -m flybfm fight --blue brain --red level --replay web/replays/brain_perch.json`
+
+**Live training** (new): `flybfm serve` now has `/api/train/*` endpoints. Click ⚙ train in header to open training bar — configurable gens/pop/episodes, policy/basis, scenario mix (40% easy gunnery 250-900m ±30°, 30% defensive jittered defensive/topgun_break, 30% random), curriculum 15-20s→30-45s→60-90s, evals prioritized (defaults 12×24×8=2304 fights). Training runs in terminal (server subprocess, `start_new_session=True`), survives window close; viewer shows live match of a random training fly while waiting, plus best result. See `docs/LIVE_TRAINING.md` for feasibility and `python -m flybfm train --help`.
+
+Training quickstart:
+```bash
+python -m flybfm serve --port 8000 &
+python -m flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json --generations 12 --population 24 --episodes 8
+# open http://localhost:8000, click 👁 watch live fly
+```
 
 ## Layout
 

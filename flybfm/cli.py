@@ -17,6 +17,11 @@ import os
 import random
 import sys
 import time
+import subprocess
+import signal
+from http import HTTPStatus
+import http.server
+import socketserver
 
 from .analysis.metrics import episode_metrics, format_scorecard, scorecard
 from .sim.arena import CANONICAL_SETUPS, Scenario, ScenarioSpace
@@ -126,23 +131,50 @@ def cmd_train(args) -> int:
         raise SystemExit("policy must be 'features' or 'brain'")
     if args.policy == "brain":
         init = globals().get("init", None)
+
+    # curriculum + scenario mix
+    easy_frac = getattr(args, "easy_frac", 0.4)
+    defensive_frac = getattr(args, "defensive_frac", 0.3)
+    random_frac = getattr(args, "random_frac", 0.3)
+    # normalize if needed
+    tot = easy_frac + defensive_frac + random_frac
+    if tot > 0:
+        easy_frac /= tot
+        defensive_frac /= tot
+        random_frac /= tot
+
     cfg = CEMConfig(generations=args.generations, population=args.population,
                     episodes_per_candidate=args.episodes, max_time_s=args.max_time,
                     decision_dt=args.decision_dt, seed=args.seed,
-                    eval_every=args.eval_every)
+                    eval_every=args.eval_every,
+                    easy_frac=easy_frac, defensive_frac=defensive_frac, random_frac=random_frac,
+                    use_curriculum=not getattr(args, "no_curriculum", False),
+                    live_replay_path=getattr(args, "live_replay", None),
+                    live_status_path=getattr(args, "live_status", None),
+                    live_every=getattr(args, "live_every", 1),
+                    live_max_time_s=getattr(args, "live_max_time", 60.0))
     if args.sigma0 is not None:
         cfg.sigma0 = args.sigma0
+    total_fights = cfg.generations * cfg.population * cfg.episodes_per_candidate
     print(f"training {args.policy} ({basis} basis): {n_params} parameters, "
-          f"{cfg.generations} generations x {cfg.population} candidates x "
-          f"{cfg.episodes_per_candidate} fights")
-    space = ScenarioSpace()
-    if getattr(args, "easy_frac", 0.0) > 0.0:
-        from .train.cem import MixedSpace
-        space = MixedSpace(easy_frac=args.easy_frac, seed=args.seed)
-        print(f"curriculum: {100*args.easy_frac:.0f}% of training starts are gunnery-range starts")
+          f"{cfg.generations} gens x {cfg.population} pop x {cfg.episodes_per_candidate} ep = {total_fights} fights")
+    print(f"scenario mix: easy {100*cfg.easy_frac:.0f}% gunnery (250-900m ±30°), "
+          f"defensive {100*cfg.defensive_frac:.0f}% (defensive/topgun_break jitter), "
+          f"random {100*cfg.random_frac:.0f}% fully random")
+    if cfg.use_curriculum:
+        print(f"curriculum: episode length 15-20s → 30-45s → 60-90s across generations")
+    else:
+        print(f"curriculum: off, fixed max_time {cfg.max_time_s}s")
+    if cfg.live_replay_path:
+        print(f"live replay -> {cfg.live_replay_path}, status -> {cfg.live_status_path}")
+
+    from .train.cem import BalancedTrainingSpace
+    space = BalancedTrainingSpace(easy_frac=cfg.easy_frac, defensive_frac=cfg.defensive_frac,
+                                  random_frac=cfg.random_frac, seed=args.seed)
     res = train(factory, n_params, space, pool, cfg, init_params=init, out_dir=out_dir,
                 meta={"basis": basis, "init": args.init,
-                      "easy_frac": getattr(args, "easy_frac", 0.0)})
+                      "easy_frac": cfg.easy_frac, "defensive_frac": cfg.defensive_frac,
+                      "random_frac": cfg.random_frac})
     print(f"best mean episode return: {res['best']['score']:+.2f}")
     print("opponent pool after training:")
     for row in res["pool"]:
@@ -211,14 +243,282 @@ def cmd_replay(args) -> int:
     return _rebuild_manifest(args.dir)
 
 
+# ------------------------------------------------------------------ serve with live training API
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_live_status(status_path: str, pid_path: str, log_path: str) -> dict:
+    running = False
+    pid = None
+    if os.path.exists(pid_path):
+        try:
+            with open(pid_path) as fh:
+                pid = int(fh.read().strip())
+            running = _is_pid_alive(pid)
+        except Exception:
+            pid = None
+    status = {}
+    if os.path.exists(status_path):
+        try:
+            with open(status_path) as fh:
+                status = json.load(fh)
+        except Exception as e:
+            status = {"error": f"failed to read status: {e}"}
+    return {"running": running, "pid": pid, "status": status,
+            "log_exists": os.path.exists(log_path),
+            "status_path": status_path}
+
+
+class LiveTrainingHandler(http.server.SimpleHTTPRequestHandler):
+    """Serves web/ statically plus /api/train/* endpoints."""
+
+    def __init__(self, *args, web_dir=None, runs_dir=None, **kwargs):
+        self.web_dir = web_dir or "web"
+        self.runs_dir = runs_dir or "runs/live"
+        super().__init__(*args, directory=self.web_dir, **kwargs)
+
+    def log_message(self, format, *args):
+        # quieter than default, but keep for debugging
+        sys.stderr.write(f"{self.client_address[0]} - - [{self.log_date_time_string()}] {format % args}\n")
+
+    def do_GET(self):
+        if self.path.startswith("/api/"):
+            self._handle_api_get()
+        else:
+            # default static file serving
+            return super().do_GET()
+
+    def do_POST(self):
+        if self.path.startswith("/api/"):
+            self._handle_api_post()
+        else:
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def _handle_api_get(self):
+        # /api/train/status
+        if self.path.startswith("/api/train/status"):
+            status_path = os.path.join(self.runs_dir, "status.json")
+            pid_path = os.path.join(self.runs_dir, "pid.txt")
+            log_path = os.path.join(self.runs_dir, "train.log")
+            data = _read_live_status(status_path, pid_path, log_path)
+            self._send_json(data)
+            return
+        # /api/train/live -> serve live replay if exists
+        if self.path.startswith("/api/train/live"):
+            # support ?raw=1 to get raw file
+            live_path = os.path.join(self.web_dir, "replays", "live.json")
+            alt_path = os.path.join(self.runs_dir, "live.json")
+            path = live_path if os.path.exists(live_path) else alt_path
+            if not os.path.exists(path):
+                # also check configured live path from last training
+                self._send_json({"error": "no live replay yet", "path": path}, status=HTTPStatus.NOT_FOUND)
+                return
+            try:
+                with open(path) as fh:
+                    data = json.load(fh)
+                self._send_json(data)
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        # /api/train/log?lines=200
+        if self.path.startswith("/api/train/log"):
+            log_path = os.path.join(self.runs_dir, "train.log")
+            lines = 200
+            try:
+                from urllib.parse import urlparse, parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                if "lines" in qs:
+                    lines = int(qs["lines"][0])
+            except Exception:
+                pass
+            if not os.path.exists(log_path):
+                self._send_json({"log": "", "error": "no log file"})
+                return
+            try:
+                # tail
+                with open(log_path, "rb") as fh:
+                    # crude tail
+                    fh.seek(0, os.SEEK_END)
+                    size = fh.tell()
+                    block = 8192
+                    data = b""
+                    while len(data.splitlines()) <= lines and size > 0:
+                        read_size = min(block, size)
+                        size -= read_size
+                        fh.seek(size)
+                        data = fh.read(read_size) + data
+                        if size == 0:
+                            break
+                    text = data.decode(errors="ignore")
+                    # keep last N lines
+                    out_lines = text.splitlines()[-lines:]
+                self._send_json({"log": "\n".join(out_lines)})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        # /api/replays -> manifest
+        if self.path.startswith("/api/replays"):
+            # serve index.json
+            idx_path = os.path.join(self.web_dir, "replays", "index.json")
+            if os.path.exists(idx_path):
+                with open(idx_path) as fh:
+                    self._send_json(json.load(fh))
+            else:
+                self._send_json({"replays": []})
+            return
+        self.send_error(HTTPStatus.NOT_FOUND, "API endpoint not found")
+
+    def _handle_api_post(self):
+        # read body
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if self.path.startswith("/api/train/start"):
+            # start training subprocess in terminal (server's terminal), not in browser thread
+            status_path = os.path.join(self.runs_dir, "status.json")
+            pid_path = os.path.join(self.runs_dir, "pid.txt")
+            log_path = os.path.join(self.runs_dir, "train.log")
+            # check if already running
+            if os.path.exists(pid_path):
+                try:
+                    with open(pid_path) as fh:
+                        pid = int(fh.read().strip())
+                    if _is_pid_alive(pid):
+                        self._send_json({"error": "training already running", "pid": pid},
+                                        status=HTTPStatus.CONFLICT)
+                        return
+                except Exception:
+                    pass
+            os.makedirs(self.runs_dir, exist_ok=True)
+            os.makedirs(os.path.join(self.web_dir, "replays"), exist_ok=True)
+
+            # build command from posted config
+            generations = int(data.get("generations", 12))
+            population = int(data.get("population", 24))
+            episodes = int(data.get("episodes", 8))
+            policy = data.get("policy", "features")
+            basis = data.get("basis", "poly")
+            seed = int(data.get("seed", 0))
+            easy_frac = float(data.get("easy_frac", 0.4))
+            defensive_frac = float(data.get("defensive_frac", 0.3))
+            random_frac = float(data.get("random_frac", 0.3))
+            max_time = float(data.get("max_time", 30.0))
+            no_curriculum = bool(data.get("no_curriculum", False))
+
+            live_replay = os.path.abspath(os.path.join(self.web_dir, "replays", "live.json"))
+            live_status = os.path.abspath(status_path)
+            runs_abs = os.path.abspath(self.runs_dir)
+
+            cmd = [
+                sys.executable, "-u", "-m", "flybfm", "train",
+                "--policy", policy,
+                "--basis", basis,
+                "--generations", str(generations),
+                "--population", str(population),
+                "--episodes", str(episodes),
+                "--seed", str(seed),
+                "--easy-frac", str(easy_frac),
+                "--defensive-frac", str(defensive_frac),
+                "--random-frac", str(random_frac),
+                "--max-time", str(max_time),
+                "--out", runs_abs,
+                "--live-replay", live_replay,
+                "--live-status", live_status,
+                "--live-every", "1",
+            ]
+            if no_curriculum:
+                cmd.append("--no-curriculum")
+            # optional: imitation init
+            if data.get("init"):
+                cmd.extend(["--init", str(data["init"])])
+
+            # launch detached, log to file, survives browser close (but not server close unless nohup)
+            # Use Popen with stdout/stderr to log file
+            try:
+                log_fh = open(log_path, "w")
+                # start new process group so we can kill it later
+                proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                                        start_new_session=True, cwd=os.getcwd())
+                with open(pid_path, "w") as pf:
+                    pf.write(str(proc.pid))
+                self._send_json({"started": True, "pid": proc.pid, "cmd": " ".join(cmd),
+                                 "log": log_path, "live_replay": live_replay})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if self.path.startswith("/api/train/stop"):
+            pid_path = os.path.join(self.runs_dir, "pid.txt")
+            if not os.path.exists(pid_path):
+                self._send_json({"error": "no pid file, not running"}, status=HTTPStatus.NOT_FOUND)
+                return
+            try:
+                with open(pid_path) as fh:
+                    pid = int(fh.read().strip())
+                # kill process group
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except Exception:
+                    os.kill(pid, signal.SIGTERM)
+                time.sleep(0.5)
+                if _is_pid_alive(pid):
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except Exception:
+                        os.kill(pid, signal.SIGKILL)
+                # clean pid file
+                try:
+                    os.remove(pid_path)
+                except Exception:
+                    pass
+                self._send_json({"stopped": True, "pid": pid})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND, "API endpoint not found")
+
+    def _send_json(self, obj, status=HTTPStatus.OK):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+
 def cmd_serve(args) -> int:
-    import http.server
-    import socketserver
-    os.chdir(args.dir)
-    handler = http.server.SimpleHTTPRequestHandler
+    web_dir = args.dir
+    runs_dir = getattr(args, "runs_dir", os.path.join("runs", "live"))
+    os.makedirs(web_dir, exist_ok=True)
+    os.makedirs(runs_dir, exist_ok=True)
+    # ensure replays dir exists
+    os.makedirs(os.path.join(web_dir, "replays"), exist_ok=True)
+
+    handler = lambda *a, **kw: LiveTrainingHandler(*a, web_dir=web_dir, runs_dir=runs_dir, **kw)
     with socketserver.TCPServer((args.host, args.port), handler) as httpd:
-        print(f"serving {os.getcwd()} on http://{args.host}:{args.port}/ (Ctrl-C to stop)")
-        httpd.serve_forever()
+        print(f"serving {os.path.abspath(web_dir)} on http://{args.host}:{args.port}/")
+        print(f"  live training API: POST http://{args.host}:{args.port}/api/train/start")
+        print(f"  status: GET http://{args.host}:{args.port}/api/train/status")
+        print(f"  live replay: GET http://{args.host}:{args.port}/api/train/live")
+        print(f"  log tail: GET http://{args.host}:{args.port}/api/train/log?lines=200")
+        print(f"  training out dir: {os.path.abspath(runs_dir)}")
+        print(f"  training survives browser close (runs in terminal/server process)")
+        print(f"  Ctrl-C to stop server (training subprocess will keep running unless stopped via API)")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nserver stopped")
     return 0
 
 
@@ -303,18 +603,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     t = sub.add_parser("train", help="train a policy by CEM/ES")
     t.add_argument("--policy", default="features", choices=["features", "brain"])
-    t.add_argument("--generations", type=int, default=6)
-    t.add_argument("--population", type=int, default=10)
-    t.add_argument("--episodes", type=int, default=3)
-    t.add_argument("--max-time", type=float, default=30.0)
+    t.add_argument("--generations", type=int, default=12,
+                   help="number of generations (default 12, ~2304 fights with new defaults)")
+    t.add_argument("--population", type=int, default=24,
+                   help="candidates per generation (default 24)")
+    t.add_argument("--episodes", type=int, default=8,
+                   help="fights per candidate (default 8, prioritize evals over length)")
+    t.add_argument("--max-time", type=float, default=30.0,
+                   help="max time per episode when curriculum off (default 30s)")
     t.add_argument("--decision-dt", type=float, default=0.1)
     t.add_argument("--eval-every", type=int, default=2)
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--init", default="imitation", choices=["imitation", "random"])
     t.add_argument("--basis", default="poly", choices=["linear", "poly"],
                    help="action basis; the linear one cannot aim (see docs/EXPERIMENTS.md 5)")
-    t.add_argument("--easy-frac", type=float, default=0.5, dest="easy_frac",
-                   help="fraction of training starts drawn near the gun envelope")
+    t.add_argument("--easy-frac", type=float, default=0.4, dest="easy_frac",
+                   help="fraction easy gunnery starts 250-900m ±30° (default 0.4)")
+    t.add_argument("--defensive-frac", type=float, default=0.3, dest="defensive_frac",
+                   help="fraction defensive starts from defensive/topgun_break + jitter (default 0.3)")
+    t.add_argument("--random-frac", type=float, default=0.3, dest="random_frac",
+                   help="fraction fully random starts (default 0.3)")
+    t.add_argument("--no-curriculum", action="store_true",
+                   help="disable episode-length curriculum (15-20s→30-45s→60-90s)")
+    t.add_argument("--live-replay", default=None,
+                   help="write live best-vs-random replay each gen for viewer (e.g. web/replays/live.json)")
+    t.add_argument("--live-status", default=None,
+                   help="write live status json each gen (e.g. runs/live/status.json)")
+    t.add_argument("--live-every", type=int, default=1,
+                   help="how often to write live replay (generations)")
+    t.add_argument("--live-max-time", type=float, default=60.0,
+                   help="max time for live replay fights")
     t.add_argument("--resume", default=None,
                    help="continue from a training.json (keeps its basis; ignores --init)")
     t.add_argument("--sigma0", type=float, default=None,
@@ -367,8 +685,9 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--dir", default=os.path.join("web", "replays"))
     rp.set_defaults(func=cmd_replay)
 
-    sv = sub.add_parser("serve", help="serve the replay viewer")
-    sv.add_argument("--dir", default="web")
+    sv = sub.add_parser("serve", help="serve the replay viewer + live training API")
+    sv.add_argument("--dir", default="web", help="web root to serve (default web)")
+    sv.add_argument("--runs-dir", default=os.path.join("runs", "live"), help="dir for live training status/log")
     sv.add_argument("--port", type=int, default=8000)
     sv.add_argument("--host", default="0.0.0.0")
     sv.set_defaults(func=cmd_serve)

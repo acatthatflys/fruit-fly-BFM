@@ -18,6 +18,15 @@ Why CEM/ES rather than PPO
 If you want gradients instead, the environment exposes `observation_vector`
 and a dense reward; PPO/SAC will drop straight in and the reward design in
 sim/reward.py (potential-based shaping) is exactly what they need.
+
+Training improvements (2026-09):
+  * Scenario distribution: 40% easy gunnery, 30% fully random, 30% defensive
+    (defensive + topgun_break with jitter) — fly regularly sees genuinely
+    defensive situations, not just neutral/easy.
+  * Episode-length curriculum: 15-20s → 30-45s → 60-90s across generations,
+    so evolution first learns acquisition/pursuit, then maintaining advantage
+    and recovery.
+  * Prioritize evaluations over length: thousands of fights, not few hundred.
 """
 from __future__ import annotations
 
@@ -48,7 +57,6 @@ def run_episode(scenario: Scenario, learner, opponent, env_cfg: EnvConfig,
         cr = opponent(env.red, env)
         obs, rewards, done, info = env.step(cb, cr)
         if learn and hasattr(learner, "observe_reward"):
-            # dopamine arrives after the outcome: the TD-error teaching signal
             learner.observe_reward(env.observation_vector(env.blue), rewards["blue"])
         returns += rewards["blue"]
     outcome = {"blue": "win", "red": "loss", "draw": "draw", "mutual": "draw"}.get(env.result, "draw")
@@ -107,40 +115,94 @@ def evaluate(policy, scenarios: Sequence[Scenario], opponents: Sequence,
 # ----------------------------------------------------------------------------
 @dataclass
 class CEMConfig:
-    generations: int = 8
-    population: int = 12
+    generations: int = 12
+    population: int = 24
     elite_frac: float = 0.25
     sigma0: float = 0.5
     sigma_min: float = 0.05
-    episodes_per_candidate: int = 3
+    episodes_per_candidate: int = 8
     eval_every: int = 2
     max_time_s: float = 30.0
     decision_dt: float = 0.1
     seed: int = 0
     freeze_every: int = 3
     verbose: bool = True
+    # scenario distribution and curriculum
+    easy_frac: float = 0.4
+    defensive_frac: float = 0.3
+    random_frac: float = 0.3
+    use_curriculum: bool = True
+    curriculum: List[Tuple[float, float, float]] = field(default_factory=lambda: [
+        (0.0, 15.0, 20.0),   # first 30% gens: 15-20s (acquisition & pursuit)
+        (0.3, 30.0, 45.0),   # next 40%: 30-45s (skills emerge)
+        (0.7, 60.0, 90.0),   # last 30%: 60-90s (maintain advantage, recovery)
+    ])
+    # live training viewer support
+    live_replay_path: Optional[str] = None
+    live_status_path: Optional[str] = None
+    live_every: int = 1
+    live_max_time_s: float = 60.0
 
 
-class MixedSpace:
-    """Scenario sampler that mixes fully random starts with gunnery-range starts.
+def _get_max_time_for_gen(gen: int, total_gens: int, cfg: CEMConfig, rng: random.Random) -> float:
+    """Episode-length curriculum: sample max_time based on generation progress.
 
-    The gun needs the nose inside about a degree.  Uniform random starts spread
-    the learner over the whole 12 km arena, so the fraction of training time spent
-    anywhere near a firing solution is tiny and the shooting skill never gets a
-    gradient.  This sampler deliberately oversamples close, roughly-aligned
-    starts so the sparse event can be learned, while leaving *evaluation* on the
-    fully random space: the curriculum buys signal, it does not buy the score.
+    If use_curriculum=False, returns cfg.max_time_s fixed.
+    Otherwise, picks interval based on gen/total and samples uniformly inside.
+    """
+    if not cfg.use_curriculum or not cfg.curriculum:
+        return cfg.max_time_s
+    progress = gen / max(total_gens - 1, 1)
+    # find interval where progress >= start
+    chosen = cfg.curriculum[0]
+    for start, lo, hi in cfg.curriculum:
+        if progress >= start:
+            chosen = (start, lo, hi)
+        else:
+            break
+    _, lo, hi = chosen
+    return rng.uniform(lo, hi)
+
+
+class BalancedTrainingSpace:
+    """Scenario sampler with 40% easy gunnery, 30% random, 30% defensive.
+
+    Easy: close, roughly aligned (250-900m, ±30°) — gives sparse gun event a gradient.
+    Random: fully uniform from ScenarioSpace — prevents overfitting to easy.
+    Defensive: genuinely defensive (defensive + topgun_break with jitter) — fly
+    regularly encounters being defensive, not just neutral/easy. This is the fix
+    for the previous distribution that was mostly neutral/easy-gunnery.
+
+    Fractions default to 0.4/0.3/0.3 as requested; random_frac is computed as
+    remainder if sum <1, or normalized if sum !=1.
     """
 
-    def __init__(self, easy_frac: float = 0.5, seed: int = 0):
-        self.easy_frac = easy_frac
+    def __init__(self, easy_frac: float = 0.4, defensive_frac: float = 0.3,
+                 random_frac: float = 0.3, seed: int = 0,
+                 defensive_tags: Tuple[str, ...] = ("defensive", "topgun_break")):
+        total = easy_frac + defensive_frac + random_frac
+        if total <= 0:
+            easy_frac, defensive_frac, random_frac = 0.4, 0.3, 0.3
+            total = 1.0
+        # normalize to 1
+        self.easy_frac = easy_frac / total
+        self.defensive_frac = defensive_frac / total
+        self.random_frac = random_frac / total
         self.rng = random.Random(seed)
         self.space = ScenarioSpace()
+        self.defensive_tags = defensive_tags
 
     def sample(self, rng=None, tag: str = "train") -> Scenario:
         rng = rng or self.rng
-        if rng.random() >= self.easy_frac:
+        roll = rng.random()
+        if roll < self.easy_frac:
+            return self._sample_easy(rng, tag)
+        elif roll < self.easy_frac + self.defensive_frac:
+            return self._sample_defensive(rng, tag)
+        else:
             return self.space.sample(rng, tag=tag)
+
+    def _sample_easy(self, rng: random.Random, tag: str) -> Scenario:
         return Scenario(range_m=rng.uniform(250.0, 900.0),
                         taa_deg=rng.uniform(-30.0, 30.0),
                         nose_offset_deg=rng.uniform(-30.0, 30.0),
@@ -151,6 +213,50 @@ class MixedSpace:
                         phase_deg=rng.uniform(0.0, 360.0),
                         seed=rng.randrange(1 << 30), tag=tag + "_gunnery")
 
+    def _sample_defensive(self, rng: random.Random, tag: str) -> Scenario:
+        base_tag = rng.choice(self.defensive_tags)
+        base = CANONICAL_SETUPS.get(base_tag)
+        if base is None:
+            base = CANONICAL_SETUPS["defensive"]
+        # jitter defensive: keep it defensive (TAA >90) but randomize
+        # add ±15° to TAA (clamped >90), ±20° nose offset, ±300m range, ±200m dz
+        taa = base.taa_deg + rng.gauss(0, 10.0)
+        # ensure genuinely defensive: at least 90° if base is defensive, allow some spill
+        if base.taa_deg >= 90:
+            taa = max(90.0, min(180.0, taa))
+        else:
+            taa = max(0.0, min(180.0, taa))
+
+        return Scenario(
+            range_m=max(300.0, base.range_m + rng.gauss(0, 200.0)),
+            taa_deg=taa,
+            nose_offset_deg=base.nose_offset_deg + rng.gauss(0, 15.0),
+            dz_m=base.dz_m + rng.gauss(0, 120.0),
+            alt_m=max(2500.0, min(9000.0, base.alt_m + rng.gauss(0, 400.0))),
+            v_a=max(150.0, min(340.0, base.v_a + rng.gauss(0, 20.0))),
+            v_t=max(150.0, min(340.0, base.v_t + rng.gauss(0, 20.0))),
+            phase_deg=rng.uniform(0, 360),
+            bank_a_deg=rng.uniform(-60, 60),
+            gamma_a_deg=rng.uniform(-30, 30),
+            gamma_t_deg=rng.uniform(-30, 30),
+            seed=rng.randrange(1 << 30),
+            tag=tag + f"_{base_tag}",
+        )
+
+
+class MixedSpace(BalancedTrainingSpace):
+    """Backward compat: old name, now 40/30/30 by default.
+
+    Previously only easy vs random (easy_frac). Now defaults to balanced
+    40% easy, 30% defensive, 30% random as requested. If called with only
+    easy_frac, defensive is set to 0.3 and random is remainder.
+    """
+
+    def __init__(self, easy_frac: float = 0.4, seed: int = 0,
+                 defensive_frac: float = 0.3, random_frac: float = 0.3):
+        super().__init__(easy_frac=easy_frac, defensive_frac=defensive_frac,
+                         random_frac=random_frac, seed=seed)
+
 
 def train(policy_factory: Callable[[Sequence[float]], object],
           n_params: int,
@@ -160,11 +266,16 @@ def train(policy_factory: Callable[[Sequence[float]], object],
           init_params: Optional[Sequence[float]] = None,
           out_dir: Optional[str] = None,
           meta: Optional[dict] = None) -> dict:
-    """Optimise `n_params` numbers to maximise mean episodic return."""
+    """Optimise `n_params` numbers to maximise mean episodic return.
+
+    New defaults: 12 gens × 24 pop × 8 episodes = 2304 fights (thousands, not
+    few hundred), with 40/30/30 scenario mix and episode-length curriculum
+    15-20s → 30-45s → 60-90s. If compute limited, prioritize more evaluations
+    over longer episodes (more fights improves learning more than 3× length).
+    """
     cfg = cfg or CEMConfig()
     rng = random.Random(cfg.seed)
     pool = pool or OpponentPool(seed=cfg.seed)
-    env_cfg = EnvConfig(decision_dt=cfg.decision_dt, max_time_s=cfg.max_time_s)
     rc = RewardConfig()
 
     mu = list(init_params) if init_params else [0.0] * n_params
@@ -186,10 +297,12 @@ def train(policy_factory: Callable[[Sequence[float]], object],
             for k in range(cfg.episodes_per_candidate):
                 sc = space.sample(rng, tag="train")
                 rec = pool.sample(rng)
+                # curriculum: episode length based on generation progress
+                max_time = _get_max_time_for_gen(gen, cfg.generations, cfg, rng)
+                env_cfg = EnvConfig(decision_dt=cfg.decision_dt, max_time_s=max_time)
                 info, _ = run_episode(sc, policy, rec.policy, env_cfg, rc,
                                       learn=True, record=False)
                 total += info["return"]
-                # bookkeeping for PFSP: who is still beating the learner
                 if hasattr(rec.policy, "observe_reward"):
                     rec.policy.observe_reward((0.0,) * 18, 0.0)
                 rec.register(info["result"])
@@ -200,7 +313,6 @@ def train(policy_factory: Callable[[Sequence[float]], object],
         elite_scores = [scores[i] for i in order[:n_elite]]
         if elite_scores[0] > best["score"]:
             best = {"score": elite_scores[0], "params": list(cand_params[order[0]])}
-        # CEM update
         for i in range(n_params):
             vals = [e[i] for e in elite]
             m = sum(vals) / len(vals)
@@ -210,14 +322,13 @@ def train(policy_factory: Callable[[Sequence[float]], object],
 
         gen_info = {"generation": gen, "best_return": elite_scores[0],
                     "mean_return": sum(scores) / len(scores),
-                    "wall_s": round(time.time() - t0, 2)}
+                    "wall_s": round(time.time() - t0, 2),
+                    "max_time_s": round(_get_max_time_for_gen(gen, cfg.generations, cfg, random.Random(cfg.seed + gen)), 1),
+                    "scenario_mix": {"easy": cfg.easy_frac, "defensive": cfg.defensive_frac, "random": cfg.random_frac}}
         if cfg.eval_every and gen % cfg.eval_every == 0:
-            # Evaluate what actually gets saved.  The distribution mean and the
-            # best member of the population are different policies, and reporting
-            # the mean while writing `best.params` to disk is how a run ends up
-            # claiming a 0.46 win rate for a checkpoint that scores 0.03.
+            eval_cfg = EnvConfig(decision_dt=cfg.decision_dt, max_time_s=60.0)
             gen_info["eval"] = evaluate(policy_factory(best["params"]), _eval_scenarios(),
-                                        [r.policy for r in pool.records], env_cfg, rc,
+                                        [r.policy for r in pool.records], eval_cfg, rc,
                                         seed=cfg.seed + gen)
         snap = league.maybe_freeze(gen, type("P", (), {"params": mu})(), elite_scores[0])
         if snap:
@@ -226,20 +337,101 @@ def train(policy_factory: Callable[[Sequence[float]], object],
         if cfg.verbose:
             ev = gen_info.get("eval", {})
             print(f"[gen {gen:2d}] best={elite_scores[0]:+8.2f} mean={gen_info['mean_return']:+8.2f} "
-                  f"({gen_info['wall_s']:5.1f}s)"
-                  + (f"  win={ev.get('win_rate', 0):.2f} hit%={100*ev.get('hit_rate', 0):.1f}" if ev else ""))
+                  f"({gen_info['wall_s']:5.1f}s, max_time={gen_info['max_time_s']:.0f}s) "
+                  + (f" win={ev.get('win_rate', 0):.2f} hit%={100*ev.get('hit_rate', 0):.1f}" if ev else ""))
+
+        # live status + live replay for viewer while training
+        try:
+            if cfg.live_status_path:
+                os.makedirs(os.path.dirname(cfg.live_status_path) or ".", exist_ok=True)
+                live_status = {
+                    "generation": gen,
+                    "total_generations": cfg.generations,
+                    "best_return": elite_scores[0],
+                    "mean_return": gen_info["mean_return"],
+                    "best": best,
+                    "history": history[-10:],
+                    "pool": pool.summary(),
+                    "config": {"generations": cfg.generations, "population": cfg.population,
+                               "episodes_per_candidate": cfg.episodes_per_candidate,
+                               "easy_frac": cfg.easy_frac, "defensive_frac": cfg.defensive_frac,
+                               "random_frac": cfg.random_frac},
+                    "eval": gen_info.get("eval"),
+                    "timestamp": time.time(),
+                }
+                # atomic write via tmp
+                tmp = cfg.live_status_path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(live_status, fh, indent=2)
+                os.replace(tmp, cfg.live_status_path)
+            if cfg.live_replay_path and (gen % cfg.live_every == 0 or gen == cfg.generations - 1):
+                # pick a random training scenario and opponent to show live fly
+                # use best policy vs random pool sample, plus one vs defensive to show variety
+                best_policy = policy_factory(best["params"])
+                # alternate between random and defensive for visual variety
+                sc_tag = "live"
+                sc = space.sample(rng, tag=sc_tag)
+                opp_rec = pool.sample(rng)
+                env_cfg_live = EnvConfig(decision_dt=cfg.decision_dt, max_time_s=cfg.live_max_time_s)
+                # run_match returns summary, trace, env with frames
+                _, _, env_live = run_match(sc, best_policy, opp_rec.policy, env_cfg_live, record=True)
+                replay = env_live.to_replay()
+                replay["blue_name"] = f"gen{gen}_best"
+                replay["red_name"] = opp_rec.name
+                replay["generation"] = gen
+                replay["scenario"]["desc"] = f"live gen {gen} best vs {opp_rec.name} — {sc.describe()}"
+                # add manoeuvre summary if available
+                try:
+                    from ..analysis.maneuvers import classify_trajectory
+                    replay["manoeuvres"] = classify_trajectory(env_live.frames).summary()
+                except Exception:
+                    pass
+                try:
+                    from ..analysis.metrics import episode_metrics
+                    replay["metrics"] = episode_metrics(env_live).as_dict()
+                except Exception:
+                    pass
+                os.makedirs(os.path.dirname(cfg.live_replay_path) or ".", exist_ok=True)
+                tmp = cfg.live_replay_path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(replay, fh, separators=(",", ":"))
+                os.replace(tmp, cfg.live_replay_path)
+        except Exception as exc:
+            if cfg.verbose:
+                print(f"[live] warning: failed to write live files: {exc}")
 
     result = {"best": best, "mu": mu, "sigma": sigma, "history": history,
-              "pool": pool.summary()}
+              "pool": pool.summary(),
+              "config": {"generations": cfg.generations, "population": cfg.population,
+                         "episodes_per_candidate": cfg.episodes_per_candidate,
+                         "easy_frac": cfg.easy_frac, "defensive_frac": cfg.defensive_frac,
+                         "random_frac": cfg.random_frac, "use_curriculum": cfg.use_curriculum,
+                         "curriculum": cfg.curriculum}}
     if meta:
         result.update(meta)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "training.json"), "w") as fh:
             json.dump(result, fh, indent=2)
+        # also copy final best replay to out_dir if live path not set
+        if not cfg.live_replay_path:
+            try:
+                best_policy = policy_factory(best["params"])
+                sc = _eval_scenarios()[0]
+                opp = pool.records[0].policy if pool.records else None
+                if opp:
+                    _, _, env_final = run_match(sc, best_policy, opp,
+                                                EnvConfig(decision_dt=cfg.decision_dt, max_time_s=60.0),
+                                                record=True)
+                    replay = env_final.to_replay()
+                    replay["blue_name"] = "best"
+                    replay["red_name"] = pool.records[0].name if pool.records else "opponent"
+                    with open(os.path.join(out_dir, "best_replay.json"), "w") as fh:
+                        json.dump(replay, fh, separators=(",", ":"))
+            except Exception:
+                pass
     return result
 
 
 def _eval_scenarios() -> List[Scenario]:
-    """Held-out evaluation: the canonical human-instructor setups."""
     return list(CANONICAL_SETUPS.values())
