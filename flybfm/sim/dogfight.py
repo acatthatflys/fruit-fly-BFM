@@ -394,59 +394,67 @@ def _outside(s: State, cfg: EnvConfig):
     return None
 
 
+_brain_snapshot_warned = False
+
 def _brain_snapshot_from_policy(policy):
-    """Return brain dict if policy is brain-backed, else None."""
+    """Return brain dict if policy is brain-backed, else None.
+
+    Falls back to empty/zero panel on failure but warns once, so a broken
+    _groups() or rate measurement doesn't silently look like a clean zero.
+    """
+    global _brain_snapshot_warned
     try:
-        # BrainPolicyAdapter -> controller -> net
         c = getattr(policy, 'c', None)
         if c is None:
             return None
         net = getattr(c, 'net', None)
         if net is None:
             return None
-        # group rates via controller._groups()
         groups = {}
         try:
             g = c._groups()
             for k, idx in g.items():
                 try:
                     groups[k] = float(net.group_rate(idx))
-                except Exception:
+                except Exception as e:
+                    if not _brain_snapshot_warned:
+                        import warnings
+                        warnings.warn(f"brain snapshot group_rate failed for {k}: {e}")
                     groups[k] = 0.0
-        except Exception:
-            pass
-        # population rate and spikes
+        except Exception as e:
+            if not _brain_snapshot_warned:
+                import warnings
+                warnings.warn(f"brain snapshot _groups() failed: {e}")
+                _brain_snapshot_warned = True
+            # return None to signal no brain, rather than empty dict that looks valid
+            return None
+
         try:
             pop = float(net.population_rate())
-        except Exception:
+        except Exception as e:
+            if not _brain_snapshot_warned:
+                import warnings
+                warnings.warn(f"brain snapshot population_rate failed: {e}")
             pop = 0.0
         try:
             spikes = len(getattr(net, 'spikes', []))
         except Exception:
             spikes = 0
-        # DN left/right diff for stick viz
-        try:
-            turn_l = groups.get('turn_left', 0.0)
-            turn_r = groups.get('turn_right', 0.0)
-            vis_l = groups.get('vis_left', 0.0)
-            vis_r = groups.get('vis_right', 0.0)
-            pitch_up = groups.get('pitch_up', 0.0)
-            pitch_down = groups.get('pitch_down', 0.0)
-            speed = groups.get('speed', 0.0)
-            trigger = groups.get('trigger', 0.0)
-        except Exception:
-            turn_l = turn_r = vis_l = vis_r = pitch_up = pitch_down = speed = trigger = 0.0
 
-        # also include per-type rates for full CNS viz (top types by rate)
         per_type = {}
         try:
             by_type = c.conn.index_by_type()
-            for t in list(by_type.keys())[:50]:  # limit to 50 types for replay size
+            for t in list(by_type.keys())[:50]:
                 idx = by_type.get(t, [])
                 if idx:
-                    per_type[t] = float(net.group_rate(idx))
-        except Exception:
-            pass
+                    try:
+                        per_type[t] = float(net.group_rate(idx))
+                    except Exception:
+                        per_type[t] = 0.0
+        except Exception as e:
+            if not _brain_snapshot_warned:
+                import warnings
+                warnings.warn(f"brain snapshot per_type failed: {e}")
 
         return {
             'groups': groups,
@@ -455,7 +463,11 @@ def _brain_snapshot_from_policy(policy):
             'per_type': per_type,
             't': float(getattr(net, 't', 0.0)),
         }
-    except Exception:
+    except Exception as e:
+        if not _brain_snapshot_warned:
+            import warnings
+            warnings.warn(f"brain snapshot overall failed: {e}")
+            _brain_snapshot_warned = True
         return None
 
 
@@ -496,7 +508,5 @@ def run_match(scen: Scenario, policy_blue, policy_red,
             except Exception:
                 pass
         if not record:
-            # keep last frame's brain if we want to clear? but spec says clear frames
-            # we already cleared, so nothing
             env.frames = []
     return env.summary(), trace, env

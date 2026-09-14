@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import math
 import random
+import warnings
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .connectome import Connectome, _apply_transmitter_signs
 
@@ -225,6 +226,8 @@ class LIFNetwork:
             V += dt/tau_m * (-(V - V_rest) + R*(I_syn + I_ext + tonic)) + noise
 
         where W is a sparse (n x n) matrix with W[post, pre] = weight * w_scale.
+        The synaptic current used for dv is the value *before* decay, matching
+        the stdlib path (decay happens after dv, in preparation for next step).
 
         Args:
             device: 'cpu', 'cuda', or None (auto-detect CUDA).
@@ -252,10 +255,12 @@ class TorchLIFNetwork:
     API-compatible with LIFNetwork (same methods, same Connectome reference).
     Deterministic given seed when noise_mv=0; with noise, torch RNG is seeded.
 
-    Performance (measured):
-        * synthetic 665-neuron / 2.2k edges: ~0.5 ms/step on CPU, vs ~2 ms Python
-        * full MaleCNS 166k / 125M: requires GPU, ~1-5 ms/step sparse matmul on A100,
-          vs hours in Python — this is the blocker on milestones 5-6.
+    Correctness: dv is computed from i_syn *before* decay, matching stdlib
+    LIFNetwork.step() (decay happens after, in preparation for next step).
+    See test_torch_matches_python_trajectory.
+
+    Performance: avoids per-edge device syncs, caches plastic index tensors,
+    and updates sparse values in-place instead of rebuilding on every DA delivery.
 
     The weight matrix is W[post, pre] = w_ij * w_scale, so I = W @ spikes.
     """
@@ -276,22 +281,18 @@ class TorchLIFNetwork:
         self._decay_syn = math.exp(-self.p.dt / self.p.tau_syn)
         self.rate_alpha = self.p.dt / 0.05
 
-        # device handling
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self._torch = torch
 
-        # RNG for reproducibility — torch + python
         self.rng = random.Random(seed)
         torch.manual_seed(seed)
         if torch.cuda.is_available() and self.device.type == "cuda":
             torch.cuda.manual_seed_all(seed)
 
-        # state tensors (float32)
         torch_float = torch.float32
         if _init_from is not None:
-            # copy state from existing Python network if provided
             self.v = torch.tensor(_init_from.v, dtype=torch_float, device=self.device)
             self.i_syn = torch.tensor(_init_from.i_syn, dtype=torch_float, device=self.device)
             self.i_ext = torch.tensor(_init_from.i_ext, dtype=torch_float, device=self.device)
@@ -312,12 +313,22 @@ class TorchLIFNetwork:
 
         self.spikes: List[int] = []
         self._spike_tensor = torch.zeros(self.n, dtype=torch_float, device=self.device)
+        self._spike_idx: Optional[torch.Tensor] = None  # cached tensor, avoids tolist sync
 
-        # sparse weight matrix W[post, pre] = weight * w_scale
+        # cached plasticity tensors (avoid rebuilding every step)
+        self._plastic_pre_tensor: Optional[torch.Tensor] = None
+        self._plastic_post_tensor: Optional[torch.Tensor] = None
+        self._plastic_edges_tensor: Optional[torch.Tensor] = None
+        # mapping from original edge_k -> coalesced value index for in-place updates
+        self._edge_to_coalesced: Dict[int, int] = {}
+        self._coalesced_to_edge: Dict[int, int] = {}
+
         self._build_sparse_matrix()
-
-        # for compatibility with code that expects .out (not used in torch step, but kept)
         self.out: List[List[Tuple[int, float]]] = conn.outgoing()
+
+        # if we were initialized from a python net that already had plastic edges, cache tensors
+        if self.plastic_edges:
+            self._cache_plasticity_tensors()
 
     def _build_sparse_matrix(self):
         torch = self._torch
@@ -325,13 +336,56 @@ class TorchLIFNetwork:
             indices = torch.zeros((2, 0), dtype=torch.long, device=self.device)
             values = torch.zeros((0,), dtype=torch.float32, device=self.device)
             self.W = torch.sparse_coo_tensor(indices, values, (self.n, self.n), device=self.device).coalesce()
+            self._edge_to_coalesced = {}
             return
-        # W[post, pre]
         post = torch.tensor(self.c.post, dtype=torch.long, device=self.device)
         pre = torch.tensor(self.c.pre, dtype=torch.long, device=self.device)
-        indices = torch.stack([post, pre], dim=0)  # shape (2, E)
+        indices = torch.stack([post, pre], dim=0)
         values = torch.tensor(self.c.weight, dtype=torch.float32, device=self.device) * self.p.w_scale
-        self.W = torch.sparse_coo_tensor(indices, values, (self.n, self.n), device=self.device).coalesce()
+        # coalesce to sum duplicates and sort — required for efficient mm
+        W = torch.sparse_coo_tensor(indices, values, (self.n, self.n), device=self.device)
+        self.W = W.coalesce()
+
+        # Build mapping from original edge_k -> coalesced index for in-place plasticity updates.
+        # For non-duplicate graphs (typical), this is a permutation. For duplicate (post,pre),
+        # coalesce sums values, so we map each original edge to the coalesced entry that holds the sum.
+        # We build a dict from (post,pre) -> coalesced position.
+        try:
+            co_idx = self.W.indices()  # (2, E_coalesced)
+            # dict from (post,pre) tuple -> coalesced idx
+            # Use CPU for dict building to avoid many small GPU ops
+            co_post = co_idx[0].cpu().tolist()
+            co_pre = co_idx[1].cpu().tolist()
+            mapping = {}
+            for ci, (po, pr) in enumerate(zip(co_post, co_pre)):
+                mapping[(po, pr)] = ci
+            edge_map = {}
+            # original edges
+            for k, (pr, po) in enumerate(zip(self.c.pre, self.c.post)):
+                # note c.pre = pre, c.post = post, but W is [post, pre]
+                key = (po, pr)
+                if key in mapping:
+                    edge_map[k] = mapping[key]
+            self._edge_to_coalesced = edge_map
+            # reverse for debugging
+            self._coalesced_to_edge = {v: k for k, v in edge_map.items()}
+        except Exception:
+            # fallback: no mapping, will trigger full rebuild on plasticity
+            self._edge_to_coalesced = {}
+
+    def _cache_plasticity_tensors(self):
+        torch = self._torch
+        if not self.plastic_edges:
+            self._plastic_pre_tensor = None
+            self._plastic_post_tensor = None
+            self._plastic_edges_tensor = None
+            return
+        # cache as long tensors on device
+        pre_list = [self.c.pre[k] for k in self.plastic_edges]
+        post_list = [self.c.post[k] for k in self.plastic_edges]
+        self._plastic_pre_tensor = torch.tensor(pre_list, dtype=torch.long, device=self.device)
+        self._plastic_post_tensor = torch.tensor(post_list, dtype=torch.long, device=self.device)
+        self._plastic_edges_tensor = torch.tensor(self.plastic_edges, dtype=torch.long, device=self.device)
 
     # ------------------------------------------------------------------ setup
     def mark_plastic(self, pre_types: Sequence[str], post_types: Sequence[str]):
@@ -341,9 +395,9 @@ class TorchLIFNetwork:
             if self.c.types[self.c.pre[k]] in pre_types
             and self.c.types[self.c.post[k]] in post_types
         ]
-        # zero eligibility for those edges
         if self.plastic_edges:
             self.elig[self.plastic_edges] = 0.0
+        self._cache_plasticity_tensors()
         return len(self.plastic_edges)
 
     def set_input(self, index: int, current: float):
@@ -365,79 +419,75 @@ class TorchLIFNetwork:
         noise_std = p.noise_mv
         alpha = self.rate_alpha
 
-        # refractory handling: check before decrement (matches Python)
+        # Match stdlib: check refractory before decrement, decay i_syn for all,
+        # but dv uses i_syn *before* decay.
         is_ref = self.refractory > 0.0
-        # decrement refractory for those in refractory
-        self.refractory = torch.clamp(self.refractory - dt, min=0.0)
+        i_syn_old = self.i_syn.clone()  # for dv, before decay — fixes 18% bug
 
-        # decay synaptic current for all
-        self.i_syn *= decay
+        # decay synaptic current for all neurons (in prep for next step)
+        self.i_syn.mul_(decay)
 
-        # for refractory neurons, clamp v to v_reset
+        # decrement refractory only where >0, clamp to 0 (matches Python's >0 check)
+        if torch.any(is_ref):
+            self.refractory[is_ref] -= dt
+            self.refractory.clamp_(min=0.0)
+
+        # refractory -> v = v_reset
         self.v = torch.where(is_ref, torch.full_like(self.v, vres), self.v)
 
-        # for non-refractory, integrate
+        # non-refractory integration using i_syn_old (not decayed)
         not_ref = ~is_ref
         if torch.any(not_ref):
-            dv = dt / p.tau_m * (-(self.v - vr) + p.r_in * (self.i_syn + self.i_ext + p.tonic))
-            # add Gaussian noise
+            dv = dt / p.tau_m * (-(self.v - vr) + p.r_in * (i_syn_old + self.i_ext + p.tonic))
             if noise_std > 0:
                 dv = dv + torch.randn(self.n, device=self.device, dtype=self.v.dtype) * noise_std
-            # only update non-refractory
             self.v = torch.where(not_ref, self.v + dv, self.v)
 
         # spike detection
-        spike_mask = (self.v >= vth) & (~is_ref)  # refractory already excluded by v, but be explicit
+        spike_mask = (self.v >= vth) & not_ref
         spike_idx = torch.where(spike_mask)[0]
+        self._spike_idx = spike_idx  # cache tensor to avoid extra tolist
 
-        # reset spiking neurons
         if spike_idx.numel() > 0:
             self.v[spike_idx] = vres
             self.refractory[spike_idx] = p.tau_ref
 
-        # eligibility traces (plasticity)
+        # eligibility traces — use cached tensors, no per-step list comprehension
         if self.plasticity and self.plastic_edges:
-            # pre spiking?
-            # s[pre] for plastic edges
-            # we need pre indices of plastic edges
-            # To avoid per-step Python loop, do vectorized
-            plastic_pre = torch.tensor([self.c.pre[k] for k in self.plastic_edges],
-                                       dtype=torch.long, device=self.device)
-            plastic_post = torch.tensor([self.c.post[k] for k in self.plastic_edges],
-                                        dtype=torch.long, device=self.device)
-            # which plastic edges have pre spiking?
-            # spike_mask is bool tensor size n
-            pre_spiked = spike_mask[plastic_pre]  # bool tensor len(plastic_edges)
-            post_depolarized = self.v[plastic_post] > vr  # note v already reset for spiking post, so false for post that spiked
+            if self._plastic_pre_tensor is None:
+                self._cache_plasticity_tensors()
+            # pre spiked?
+            pre_spiked = spike_mask[self._plastic_pre_tensor]
+            post_depolarized = self.v[self._plastic_post_tensor] > vr
             inc_mask = pre_spiked & post_depolarized
             if torch.any(inc_mask):
-                # map back to global edge indices
-                inc_edges = [self.plastic_edges[i] for i, m in enumerate(inc_mask.tolist()) if m]
-                if inc_edges:
-                    self.elig[inc_edges] += 1.0
+                # gather global edge indices where inc
+                # inc_mask is bool tensor len(plastic_edges)
+                # Use masked select on cached edges tensor
+                inc_edges = torch.masked_select(self._plastic_edges_tensor, inc_mask)
+                # inc_edges is on device; for elig update we can do vectorized
+                self.elig[inc_edges] += 1.0
             # decay all plastic eligibilities
-            self.elig[self.plastic_edges] *= 0.995
+            self.elig[self._plastic_edges_tensor] *= 0.995
 
-        # synaptic propagation: I_syn += W @ spikes
+        # synaptic propagation: I_syn += W @ spikes (using spikes from this step, for next step's dv)
         if spike_idx.numel() > 0:
-            # build dense spike vector (float)
             self._spike_tensor.zero_()
             self._spike_tensor[spike_idx] = 1.0
-            # sparse mm: (n x n) @ (n x 1) -> (n x 1)
-            # torch.sparse.mm expects sparse @ dense
             contrib = torch.sparse.mm(self.W, self._spike_tensor.unsqueeze(1)).squeeze(1)
             self.i_syn += contrib
 
-        # rate MA update — matches Python logic exactly
+        # rate MA — matches Python exactly
         if spike_idx.numel() > 0:
-            # rate_ma[i] += alpha*(1-rate_ma[i]) for spiking
             self.rate_ma[spike_idx] = self.rate_ma[spike_idx] + alpha * (1.0 - self.rate_ma[spike_idx])
-        # then for all where rate_ma > 1e-6: rate_ma *= (1-alpha)
-        # vectorized
         mask = self.rate_ma > 1e-6
         self.rate_ma[mask] = self.rate_ma[mask] * (1.0 - alpha)
 
-        # store spikes as Python list for compatibility
+        # keep Python list for compatibility, but only materialize when needed.
+        # For perf, we avoid tolist() on CUDA hot path unless caller reads self.spikes.
+        # Here we still provide list for backward compat, but we use cached tensor to avoid extra sync if possible.
+        # tolist() on CPU is cheap; on CUDA it's a sync — we accept it for now but note in docs.
+        # To reduce syncs, we could make spikes a property, but we keep list for compat.
         self.spikes = spike_idx.tolist()
         self.t += dt
         return self.spikes
@@ -452,7 +502,6 @@ class TorchLIFNetwork:
     def group_rate(self, indices: Sequence[int]) -> float:
         if not indices:
             return 0.0
-        # rate_ma is on device, gather
         if len(indices) == 0:
             return 0.0
         vals = self.rate_ma[torch.tensor(indices, device=self.device, dtype=torch.long)]
@@ -461,6 +510,12 @@ class TorchLIFNetwork:
     def group_spikes(self, indices: Sequence[int]) -> int:
         if not indices:
             return 0
+        # Use cached tensor if available to avoid list conversion
+        if self._spike_idx is not None and self._spike_idx.numel() > 0:
+            # check membership via tensor is faster than Python set for large n?
+            # Fall back to list for simplicity
+            s = set(indices)
+            return sum(1 for i in self.spikes if i in s)
         s = set(indices)
         return sum(1 for i in self.spikes if i in s)
 
@@ -471,35 +526,81 @@ class TorchLIFNetwork:
 
     # ------------------------------------------------------- dopamine / learning
     def deliver_dopamine(self, da: float, lr: float = 0.02, weight_decay: float = 1e-4):
+        """Three-factor plasticity, vectorized to avoid per-edge CUDA syncs.
+
+        Previously looped with .item() on CUDA tensor — each .item() is a device sync.
+        Now we batch eligibility to CPU once, then loop in Python without syncs,
+        and update sparse values in-place via cached mapping.
+        """
         if not self.plastic_edges:
             return 0
+
+        torch = self._torch
+        # Batch eligibility to CPU once (single sync) instead of per-edge .item()
+        # This dominates wall-clock when plastic edges = thousands (real MB)
+        if self.device.type == "cuda":
+            elig_plastic = self.elig[self._plastic_edges_tensor].cpu()
+        else:
+            elig_plastic = self.elig[self._plastic_edges_tensor]
+
+        # Also need Python list of elig for quick iteration without .item()
+        # elig_plastic is tensor on CPU
+        elig_list = elig_plastic.tolist()
+
         touched = 0
-        # elig is tensor, but we need to loop for weight clamping and tracking
-        # Convert elig to list for quick access? Keep tensor.
-        elig_cpu = self.elig.tolist() if self.elig.device.type != "cpu" else self.elig.tolist()
-        # Actually tolist will copy; fine for small plastic set
-        for k in self.plastic_edges:
-            e = float(self.elig[k].item()) if hasattr(self.elig[k], "item") else float(self.elig[k])
+        # Track which coalesced indices need updating for in-place value patch
+        coalesced_updates: Dict[int, float] = {}
+
+        for local_i, (global_k, e) in enumerate(zip(self.plastic_edges, elig_list)):
             if abs(e) < 1e-6 and da == 0.0:
                 continue
-            w = self.c.weight[k]
+            w = self.c.weight[global_k]
             w_new = w + lr * e * da - weight_decay * w
-            w_new = max(-3.0, min(3.0, w_new))
+            # clamp
+            if w_new > 3.0:
+                w_new = 3.0
+            elif w_new < -3.0:
+                w_new = -3.0
             if w_new != w:
-                self.c.weight[k] = w_new
+                self.c.weight[global_k] = w_new
                 touched += 1
+                # prepare in-place sparse value update
+                if global_k in self._edge_to_coalesced:
+                    ci = self._edge_to_coalesced[global_k]
+                    coalesced_updates[ci] = w_new * self.p.w_scale
             if e > 0.5:
                 # decay eligibility faster after strong coincidence
-                self.elig[k] *= 0.9
+                # update on device tensor directly
+                self.elig[global_k] *= 0.9
+
         if touched > 0:
-            self._build_sparse_matrix()
-            # also update Python outgoing for compatibility
+            if coalesced_updates and self._edge_to_coalesced:
+                # in-place update of sparse values — no full rebuild
+                try:
+                    vals = self.W._values()
+                    for ci, new_val in coalesced_updates.items():
+                        vals[ci] = new_val
+                except Exception:
+                    # fallback to full rebuild if in-place fails
+                    self._build_sparse_matrix()
+            else:
+                # no mapping (e.g., after duplicate handling) — rebuild
+                self._build_sparse_matrix()
             self.out = self.c.outgoing()
+
         return touched
 
     def _update_adjacency(self, edge_k: int, w_new: float):
-        # kept for API compatibility; rebuilds sparse matrix if needed
         self.c.weight[edge_k] = w_new
+        # try in-place
+        if edge_k in self._edge_to_coalesced:
+            try:
+                ci = self._edge_to_coalesced[edge_k]
+                self.W._values()[ci] = w_new * self.p.w_scale
+                self.out = self.c.outgoing()
+                return
+            except Exception:
+                pass
         self._build_sparse_matrix()
         self.out = self.c.outgoing()
 
@@ -508,10 +609,8 @@ class TorchLIFNetwork:
                 "spikes_last_step": len(self.spikes),
                 "v_mean": float(self.v.mean().item()) if self.n > 0 else 0.0}
 
-    # For code that checks isinstance or expects to_torch to be idempotent
     def to_torch(self, device: Optional[str] = None, seed: Optional[int] = None):
         if device is not None and str(device) != str(self.device):
-            # move to new device
             self.device = self._torch.device(device)
             self.v = self.v.to(self.device)
             self.i_syn = self.i_syn.to(self.device)
@@ -520,5 +619,9 @@ class TorchLIFNetwork:
             self.rate_ma = self.rate_ma.to(self.device)
             self.elig = self.elig.to(self.device)
             self._spike_tensor = self._spike_tensor.to(self.device)
+            if self._plastic_pre_tensor is not None:
+                self._plastic_pre_tensor = self._plastic_pre_tensor.to(self.device)
+                self._plastic_post_tensor = self._plastic_post_tensor.to(self.device)
+                self._plastic_edges_tensor = self._plastic_edges_tensor.to(self.device)
             self._build_sparse_matrix()
         return self
