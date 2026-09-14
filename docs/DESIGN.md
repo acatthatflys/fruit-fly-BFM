@@ -158,20 +158,37 @@ Everything in the loop is swappable, because the interesting experiments are the
 ablations: connectome on/off, plasticity on/off, DA shaping level 1/2/3,
 opponent pool uniform vs PFSP.
 
-**Two layers of learning, deliberately separated:**
+**Two layers of learning, deliberately separated — and which one actually learns:**
 
-1. **Inner (biological).** Mushroom-body-style three-factor plasticity:
+1. **Inner (biological, the fly's own).** Mushroom-body-style three-factor plasticity:
    `Δw_ij = η · e_ij · DA(t) − λ w_ij`, with the eligibility trace a decaying
-   pre×post coincidence. This is the fly's own learning rule and it is available
-   in `brain/lif.py`. It is *weak* — hence the honest ablations.
-2. **Outer (engineering).** Cross-entropy method over the readout parameters.
-   Chosen over PPO/SAC for three reasons: (a) the spiking controller cannot be
-   back-propagated through without surrogate gradients and a torch rewrite;
-   (b) the search space is 10–100 numbers, where ES is competitive and far more
-   robust to reward scale; (c) it is deterministic given a seed, which makes
-   every number in the repo reproducible. If you want gradients, the env already
-   exposes `observation_vector` and a dense potential-based reward — PPO drops
-   straight in.
+   pre×post coincidence. This is the fly's own learning rule and it is implemented
+   in `brain/lif.py` (`LIFNetwork.mark_plastic`, `deliver_dopamine`) and in
+   `brain/plasticity.py`. The synthetic graph has **66 KC→MBON plastic edges**
+   (measured: `build_controller(plasticity=True).n_plastic == 66`), and the
+   torch path (`TorchLIFNetwork`) implements the same rule with a sparse matmul.
+
+   **Crucially, it is off by default and inert in all reported results.** The
+   controller is constructed with `plasticity=False` unless you explicitly pass
+   `plasticity=True`; the training loop in `train/cem.py` never enables it; and
+   every number in `runs/` and in `docs/EXPERIMENTS.md` comes from the outer loop
+   alone. On the synthetic graph, enabling it does change weights (see
+   `tests/test_brain.py::test_plasticity_path_exists`), but the signal is weak,
+   noisy, and insufficient to learn gunnery on its own — which is itself a result
+   worth reporting, and exactly what `doomfly`'s "3,000 runs, no learning" honest
+   baseline shows. If you share results publicly, say: *zero of the current
+   learning is the fly's own dopamine-gated plasticity; 100% is the outer CEM
+   loop* — unless you have explicitly enabled the inner loop and measured it.
+
+2. **Outer (engineering, what actually learns).** Cross-entropy method over the
+   readout parameters. Chosen over PPO/SAC for three reasons: (a) the spiking
+   controller cannot be back-propagated through without surrogate gradients and
+   a torch rewrite (now available as `TorchLIFNetwork`, but still non-differentiable
+   without surrogate gradients); (b) the search space is 10–100 numbers, where ES
+   is competitive and far more robust to reward scale; (c) it is deterministic
+   given a seed, which makes every number in the repo reproducible. If you want
+   gradients, the env already exposes `observation_vector` and a dense
+   potential-based reward — PPO drops straight in.
 
 ---
 
@@ -348,19 +365,40 @@ GPU. 6 needs the loop to be fast, i.e. torch.
 
 * The default "brain" is a **reduced synthetic connectome** with realistic
   degree statistics, not MaleCNS. It exercises the whole pipeline offline; the
-  real loader is in `tools/fetch_connectome.py` and needs the download.
+  real loader is in `tools/fetch_connectome.py` and needs the download. The
+  synthetic graph has 665 neurons / 2.2k edges and 66 KC→MBON plastic edges —
+  enough to unit-test the plasticity path, not enough to learn BFM biologically.
 * Synaptic weights are **not** identifiable from the connectome; the model uses
   uniform magnitudes with signs from transmitter identity, and a global gain
   that is calibrated, not measured.
-* The mushroom-body plasticity is implemented but **unproven**; the synthetic
-  graph has few or no plastic edges, so the inner learning loop is inert until a
-  real mushroom-body subgraph is loaded.
+* The mushroom-body plasticity is **implemented, tested, and off by default**.
+  `LIFNetwork.mark_plastic` finds KC→MBON edges in both synthetic and real graphs
+  (see `tests/test_brain.py` and `tests/test_connectome_loader.py`), and
+  `deliver_dopamine` applies `Δw = η·e·DA − λw`. However, `ConnectomeController`
+  defaults to `plasticity=False`, the CEM trainer never enables it, and all
+  results in `runs/` come from the outer loop. The inner loop is weak, noisy,
+  and on its own insufficient to learn gunnery — which is why `doomfly` reports
+  "3,000 runs, no learning" and why this repo is explicit: **if you quote a win
+  rate, 0% of that learning is the fly's own dopamine-gated plasticity unless
+  you explicitly enabled it**. The honest ablation is `plasticity=True` vs
+  `False` on the real MaleCNS mushroom-body subgraph.
 * The manoeuvre classifier is a **heuristic**. It is stated as one, and it is
   meant to be replaced by a learned classifier once there is data to train it.
 * The readout consumes upstream visual activity as well as DN activity, because
   the DN channel in the reduced graph is bearing-invariant. That is disclosed in
   `controller._groups()` and is the same compromise every viral demo makes
-  silently.
+  silently. `vis_gain` in `ReadoutParams` tells you which channel the behaviour
+  actually depends on.
+* Torch path: `LIFNetwork.to_torch()` now returns a runnable `TorchLIFNetwork`
+  (CPU or CUDA, sparse matmul `W[post,pre] @ spikes`), not a `NotImplementedError`.
+  Pure-Python LIF is ~1-3M synaptic events/s; the full 166k/125M CNS needs GPU
+  and runs ~1-5 ms/step on A100 — this was the blocker on milestones 5-6 and is
+  now unblocked.
+* Packaging: `pyproject.toml` + `requirements.txt` + CI (`.github/workflows/ci.yml`
+  runs `python -m unittest discover -s tests` on every push). The loader's
+  column-sniffing has a regression test with a tiny synthetic `.feather` fixture
+  (`tests/test_connectome_loader.py`) because `DATA.md` flags that columns move
+  between releases.
 * This is a simulation of air combat for reinforcement-learning research. It is
   a toy: no real vehicle, no real weapon, no export-controlled content.
 

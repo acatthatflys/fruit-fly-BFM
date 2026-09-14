@@ -1,0 +1,18 @@
+# Core: stdlib only, no runtime deps
+# Optional: uncomment as needed
+
+# GPU path (milestones 5-6) — ~100× faster than pure Python, enables full 166k-neuron CNS
+# torch>=2.0
+
+# Real MaleCNS flat loader (1.1 GB feather) + regression test fixture
+# pandas>=1.5
+# pyarrow>=12
+
+# Live neuPrint queries
+# neuprint-python>=0.4
+
+# Dev: all optional deps
+# torch>=2.0
+# pandas>=1.5
+# pyarrow>=12
+# neuprint-python>=0.4

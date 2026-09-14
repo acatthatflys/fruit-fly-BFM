@@ -10,6 +10,14 @@ Design notes
   prevents "the agent" and "the opponent" from drifting into different physics.
 * Everything is deterministic given (scenario seed, action sequence), which is
   required for reproducible replays and for black-box optimisers like CEM/ES.
+
+Gunnery-focused tuning (2026-09):
+  - trigger discipline now distinguishes good (lead<=1.5° in WEZ) vs bad
+    (lead>10° spray) vs waste (out of WEZ)
+  - points decision weight 0.35→0.05 and requires damage to win on position
+    to close "win on points, cannot shoot" loophole
+  - observation vector fine channels now lead/2° and aa/2° (was /10 and /5)
+    giving 5x gain at 1° scale
 """
 from __future__ import annotations
 
@@ -163,10 +171,6 @@ class Dogfight:
             me.lead_angle = _lead_angle(me.s, other.s)
             me.in_wez = geo.in_wez(g)
             if me.los_dir_prev is not None and cfg.decision_dt > 0:
-                # rotation rate of the LOS vector, signed relative to the nose.
-                # This is the fly's lobula-plate-style "how fast is the target
-                # sliding across my eye" signal, and the damping term for the
-                # scripted steering law.
                 ang = vm.angle_between(me.los_dir_prev, g.azimuth_el)
                 axis = vm.cross(me.los_dir_prev, g.azimuth_el)
                 sign = -1.0 if vm.dot(axis, me.s.vel) > 0 else 1.0
@@ -201,10 +205,25 @@ class Dogfight:
 
         timeout = self.t >= cfg.max_time_s
 
-        # ---- trigger discipline: rounds sent outside the envelope are waste
+        # ---- trigger discipline + staying bonus: gunnery-focused final
+        # good_solution = in_wez + lead<=1.5° regardless of trigger -> +0.5 stay bonus
+        # in_wez = in WEZ regardless of lead -> +0.05 small positive for remaining in WEZ
+        # good = trigger + in_wez + lead<=1.5° -> +2.0
+        # bad = trigger + lead>10° -> -0.01 almost negligible
+        # waste = trigger + not in_wez -> -0.01
         for me, cmd in ((self.blue, cmd_blue), (self.red, cmd_red)):
-            if cmd.trigger and not me.in_wez:
-                events[me].trigger_waste += 1
+            la = abs(me.lead_angle)
+            if me.in_wez:
+                events[me].in_wez += 1
+                if la <= self.rc.good_lead_deg:
+                    events[me].good_solution += 1
+            if cmd.trigger:
+                if not me.in_wez:
+                    events[me].trigger_waste += 1
+                if me.in_wez and la <= self.rc.good_lead_deg:
+                    events[me].good_trigger += 1
+                if la > self.rc.bad_lead_deg:
+                    events[me].bad_trigger += 1
 
         # ---- rewards
         rewards = {}
@@ -244,50 +263,75 @@ class Dogfight:
 
     # ---------------------------------------------------------------- helpers
     def _points_decision(self) -> str:
-        """Timeout = decision on points (BFM ruleset): damage, then position."""
+        """Timeout = decision on points (BFM ruleset): damage, then position.
+
+        Gunnery-focused fix (2026-09): previously 0.35 weight allowed winning
+        on position alone (nose-on, no hits) → "wins on points, cannot shoot".
+        Now 0.05 weight and requires damage advantage to win on position.
+        If damage equal, draw unless someone is decisively offensive.
+        """
         db = self.blue.hp - self.red.hp
-        pos_b = math.cos(math.radians(self.blue.geom_to_other.taa_deg))
-        pos_r = math.cos(math.radians(self.red.geom_to_other.taa_deg))
-        score = db + 0.35 * (pos_b - pos_r)
-        if abs(score) < 0.05:
-            return "draw"
-        return "blue" if score > 0 else "red"
+        # damage dominates — need actual hits to win
+        if abs(db) > 0.01:  # ~0.06 = 1 hit
+            # still add small position bonus
+            pos_b = math.cos(math.radians(self.blue.geom_to_other.taa_deg))
+            pos_r = math.cos(math.radians(self.red.geom_to_other.taa_deg))
+            score = db + 0.05 * (pos_b - pos_r)
+            if abs(score) < 0.02:
+                return "draw"
+            return "blue" if score > 0 else "red"
+        else:
+            # no damage — need decisive positional advantage to win, else draw
+            # prevents farming 74% win rate with 0 hits
+            pos_b = math.cos(math.radians(self.blue.geom_to_other.taa_deg))
+            pos_r = math.cos(math.radians(self.red.geom_to_other.taa_deg))
+            score = 0.05 * (pos_b - pos_r)
+            if abs(score) < 0.15:  # require >~25° TAA advantage
+                return "draw"
+            return "blue" if score > 0 else "red"
 
     def observe(self) -> Dict[str, tuple]:
         return {"blue": self.observation_vector(self.blue),
                 "red": self.observation_vector(self.red)}
 
     def observation_vector(self, me: Side) -> tuple:
-        """Hand-designed feature vector (used by the non-brain baselines)."""
+        """Hand-designed feature vector (used by the non-brain baselines).
+
+        Gunnery-focused final (2026-09):
+          - 22 dims (was 20, was 18): adds lead_az and lead_el separate
+            horizontal/vertical errors to ballistic lead point, not just magnitude.
+            Real pilots control those axes separately: roll = -k*az, pull = k*el.
+          - fine channels use tanh so gradient beyond 3° still exists.
+          - lead magnitude still present for trigger discipline.
+        """
         other = self.red if me is self.blue else self.blue
         g = me.geom_to_other
         s = me.s
         de = math.tanh((s.specific_energy() - other.s.specific_energy()) / 1500.0)
+        lead_az, lead_el = _lead_aa(me.s, other.s)
         return (
-            g.aa_deg / 60.0,                      # nose position, coarse
-            g.aa_vert_deg / 60.0,
-            math.cos(math.radians(g.taa_deg)),    # +1 offensive .. -1 defensive
-            g.hca_deg / 180.0,
-            min(g.range_m / 6000.0, 1.5),
-            math.tanh(g.closure_ms / 200.0),
-            me.los_rate_rad / 0.5,
-            # Fine nose error.  This slot used to be a 0.0 placeholder, which
-            # cost the linear policy the only thing that decides whether a round
-            # connects: at 600 m the nose has to be inside about a degree, and a
-            # feature that spans +-60 deg gives a linear policy a resolution of
-            # 1/60 near zero -- indistinguishable from noise once the weights are
-            # also being asked to fly the aircraft.
-            _saturate(g.aa_deg / 5.0),
-            s.v / 400.0,
-            s.gamma / math.radians(60.0),
-            math.sin(s.mu),
-            math.cos(s.mu),
-            s.n / 9.0,
-            s.throttle,
-            de,
-            _saturate(me.lead_angle / 10.0),      # ballistic lead error, fine
-            1.0 if me.in_wez else 0.0,
-            1.0 if geo.overshoot_flag(g) else 0.0,
+            g.aa_deg / 60.0,                      # 0 nose position, coarse
+            g.aa_vert_deg / 60.0,                 # 1
+            math.cos(math.radians(g.taa_deg)),    # 2 +1 offensive .. -1 defensive
+            g.hca_deg / 180.0,                    # 3
+            min(g.range_m / 6000.0, 1.5),         # 4
+            math.tanh(g.closure_ms / 200.0),      # 5
+            me.los_rate_rad / 0.5,                # 6
+            math.tanh(g.aa_deg / 2.0),            # 7 fine nose error, tanh
+            s.v / 400.0,                          # 8
+            s.gamma / math.radians(60.0),         # 9
+            math.sin(s.mu),                       # 10
+            math.cos(s.mu),                       # 11
+            s.n / 9.0,                            # 12
+            s.throttle,                           # 13
+            de,                                   # 14
+            math.tanh(me.lead_angle / 2.0),       # 15 ballistic lead error magnitude, fine
+            1.0 if me.in_wez else 0.0,            # 16
+            1.0 if geo.overshoot_flag(g) else 0.0,# 17
+            lead_az / 60.0,                       # 18 lead az coarse — horizontal error to lead point
+            lead_el / 60.0,                       # 19 lead el coarse — vertical error to lead point
+            math.tanh(lead_az / 2.0),             # 20 lead az fine
+            math.tanh(lead_el / 2.0),             # 21 lead el fine
         )
 
     def info(self) -> dict:
@@ -373,13 +417,49 @@ def _ac_snap(side: Side) -> dict:
             "es": round(s.specific_energy(), 0)}
 
 
-def _saturate(v: float, limit: float = 1.5) -> float:
-    return max(-limit, min(limit, v))
-
-
 def _lead_angle(me: State, other: State) -> float:
     from .gun import required_lead_angle_deg
     return required_lead_angle_deg(me.pos, me.vel, other.pos, other.vel)
+
+
+def _lead_aa(me: State, other: State) -> tuple:
+    """AA to ballistic lead point — returns (lead_az_deg, lead_el_deg) separate.
+
+    Real pilots control horizontal and vertical axes separately. Previous version
+    returned same magnitude for both axes with guessed sign. Now:
+      lead_az = atan2(dot(LOS,right), dot(LOS,forward))  # horizontal error
+      lead_el = atan2(dot(LOS,up), dot(LOS,forward))      # vertical error
+    So linear policy can do roll = -k*az, pull = k*el.
+    """
+    from .gun import lead_solution
+    try:
+        lead_pt, _ = lead_solution(me.pos, me.vel, other.pos, other.vel)
+    except Exception:
+        return 0.0, 0.0
+    to_lead = vm.sub(lead_pt, me.pos)
+    if vm.norm(to_lead) < 1e-6:
+        return 0.0, 0.0
+    try:
+        psi = me.psi
+        gamma = me.gamma
+        nose = (math.cos(psi) * math.cos(gamma),
+                math.sin(psi) * math.cos(gamma),
+                math.sin(gamma))
+        f = vm.unit(nose)
+    except Exception:
+        f = vm.unit(me.vel) if vm.norm(me.vel) > 1e-6 else (1.0, 0.0, 0.0)
+    right = vm.right_of(f)
+    up = vm.up_of(f, right)
+    los_u = vm.unit(to_lead)
+    fwd = vm.dot(los_u, f)
+    # avoid division by zero, clamp forward
+    fwd_c = max(fwd, 0.05)  # if behind, still give large angle
+    r = vm.dot(los_u, right)
+    u = vm.dot(los_u, up)
+    # atan2 gives signed angle
+    az = math.degrees(math.atan2(r, fwd_c))
+    el = math.degrees(math.atan2(u, fwd_c))
+    return az, el
 
 
 def _outside(s: State, cfg: EnvConfig):
@@ -394,6 +474,82 @@ def _outside(s: State, cfg: EnvConfig):
     return None
 
 
+_brain_snapshot_warned = False
+
+def _brain_snapshot_from_policy(policy):
+    """Return brain dict if policy is brain-backed, else None.
+
+    Falls back to empty/zero panel on failure but warns once, so a broken
+    _groups() or rate measurement doesn't silently look like a clean zero.
+    """
+    global _brain_snapshot_warned
+    try:
+        c = getattr(policy, 'c', None)
+        if c is None:
+            return None
+        net = getattr(c, 'net', None)
+        if net is None:
+            return None
+        groups = {}
+        try:
+            g = c._groups()
+            for k, idx in g.items():
+                try:
+                    groups[k] = float(net.group_rate(idx))
+                except Exception as e:
+                    if not _brain_snapshot_warned:
+                        import warnings
+                        warnings.warn(f"brain snapshot group_rate failed for {k}: {e}")
+                    groups[k] = 0.0
+        except Exception as e:
+            if not _brain_snapshot_warned:
+                import warnings
+                warnings.warn(f"brain snapshot _groups() failed: {e}")
+                _brain_snapshot_warned = True
+            return None
+
+        try:
+            pop = float(net.population_rate())
+        except Exception as e:
+            if not _brain_snapshot_warned:
+                import warnings
+                warnings.warn(f"brain snapshot population_rate failed: {e}")
+            pop = 0.0
+        try:
+            spikes = len(getattr(net, 'spikes', []))
+        except Exception:
+            spikes = 0
+
+        per_type = {}
+        try:
+            by_type = c.conn.index_by_type()
+            for t in list(by_type.keys())[:50]:
+                idx = by_type.get(t, [])
+                if idx:
+                    try:
+                        per_type[t] = float(net.group_rate(idx))
+                    except Exception:
+                        per_type[t] = 0.0
+        except Exception as e:
+            if not _brain_snapshot_warned:
+                import warnings
+                warnings.warn(f"brain snapshot per_type failed: {e}")
+
+        return {
+            'groups': groups,
+            'population_hz': pop,
+            'spikes_last': spikes,
+            'per_type': per_type,
+            't': float(getattr(net, 't', 0.0)),
+        }
+    except Exception as e:
+        if not _brain_snapshot_warned:
+            import warnings
+            warnings.warn(f"brain snapshot overall failed: {e}")
+            _brain_snapshot_warned = True
+        return None
+
+
 # --------------------------------------------------------------------- match
 def run_match(scen: Scenario, policy_blue, policy_red,
               cfg: Optional[EnvConfig] = None,
@@ -404,6 +560,10 @@ def run_match(scen: Scenario, policy_blue, policy_red,
     `side_view` is a light dict with the geometry + own state, so a policy can
     be a scripted rule, a linear readout, or a connectome-backed brain.
     Returns (summary, blue_reward_trace).
+
+    If a policy is brain-backed (BrainPolicyAdapter), its group rates and
+    population activity are recorded into frames as `brain` and `brain_red`
+    for the visualizer's brain-firing and fly stick panels.
     """
     env = Dogfight(cfg, rc)
     env.reset(scen)
@@ -415,6 +575,16 @@ def run_match(scen: Scenario, policy_blue, policy_red,
         cr = policy_red(vr, env)
         _, rewards, done, _ = env.step(cb, cr)
         trace.append(rewards["blue"])
+        if record and env.frames:
+            try:
+                b_snap = _brain_snapshot_from_policy(policy_blue)
+                if b_snap:
+                    env.frames[-1]['brain'] = b_snap
+                r_snap = _brain_snapshot_from_policy(policy_red)
+                if r_snap:
+                    env.frames[-1]['brain_red'] = r_snap
+            except Exception:
+                pass
         if not record:
             env.frames = []
     return env.summary(), trace, env
