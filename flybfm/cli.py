@@ -639,6 +639,11 @@ def cmd_serve(args) -> int:
         print(f"  bench: GET http://{args.host}:{args.port}/api/bench")
         print(f"  training out dir: {os.path.abspath(runs_dir)}")
         print(f"  training survives browser close (runs in terminal/server process)")
+        if args.host == "0.0.0.0":
+            print(f"  WARNING: --host 0.0.0.0 exposes /api/train/start|stop on your LAN with no auth —")
+            print(f"           anyone on same WiFi can start/stop jobs under your user. Use 127.0.0.1 for localhost-only.")
+        else:
+            print(f"  bound to {args.host} (localhost-only). Use --host 0.0.0.0 to expose on LAN.")
         print(f"  Ctrl-C to stop server (training subprocess will keep running unless stopped via API)")
         try:
             httpd.serve_forever()
@@ -818,7 +823,8 @@ def build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--dir", default="web", help="web root to serve (default web)")
     sv.add_argument("--runs-dir", default=os.path.join("runs", "live"), help="dir for live training status/log")
     sv.add_argument("--port", type=int, default=8000)
-    sv.add_argument("--host", default="0.0.0.0")
+    sv.add_argument("--host", default="127.0.0.1",
+                    help="bind host, default 127.0.0.1 (localhost only). Use 0.0.0.0 to expose on LAN (no auth on /api/train/start|stop — anyone on network can start/stop training jobs under your user).")
     sv.set_defaults(func=cmd_serve)
     return p
 

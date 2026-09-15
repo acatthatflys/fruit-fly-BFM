@@ -60,6 +60,14 @@ def run_episode(scenario: Scenario, learner, opponent, env_cfg: EnvConfig,
                 reward_cfg: RewardConfig, learn: bool = True, record: bool = False):
     """One fight. `learner` always flies blue, the opponent flies red. Returns
     (info_dict, env)."""
+    # brain policy must be reset each episode so episodes are independent —
+    # otherwise v/i_syn/refractory/rate_ma leak from previous fight (episode
+    # leakage bug). Feature/poly policies are stateless, reset is no-op.
+    if hasattr(learner, "reset"):
+        try:
+            learner.reset()
+        except Exception:
+            pass
     env = Dogfight(env_cfg, reward_cfg)
     env.reset(scenario)
     returns = 0.0

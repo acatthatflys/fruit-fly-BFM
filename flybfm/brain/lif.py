@@ -96,6 +96,31 @@ class LIFNetwork:
         for i in range(self.n):
             self.i_ext[i] = 0.0
 
+    def reset_state(self, seed: Optional[int] = None):
+        """Genuine reset back to rest — not just external drive.
+
+        Reinitializes membrane potentials, synaptic currents, refractory timers,
+        firing-rate moving averages, spikes, and eligibility traces. Called at
+        the top of each episode so episodes are independent samples (fixes
+        episode leakage bug where episode 2..N inherited v/i_syn/refractory from
+        previous fight). If seed given, re-seed rng for reproducibility.
+        """
+        if seed is not None:
+            self.rng = random.Random(seed)
+        # v_rest + uniform(-2,2) same as __init__
+        self.v = [self.p.v_rest + self.rng.uniform(-2, 2) for _ in range(self.n)]
+        self.i_syn = [0.0] * self.n
+        self.i_ext = [0.0] * self.n
+        self.refractory = [0.0] * self.n
+        self.spikes = []
+        self.rate_ma = [0.0] * self.n
+        self.t = 0.0
+        if self.plasticity:
+            self.elig = [0.0] * len(self.c.pre)
+            # keep plastic_edges list, just zero elig for them
+            for k in self.plastic_edges:
+                self.elig[k] = 0.0
+
     def step(self) -> List[int]:
         p = self.p
         dt = p.dt
@@ -167,6 +192,17 @@ class LIFNetwork:
         return sum(self.rate_ma) / max(self.n, 1)
 
     def deliver_dopamine(self, da: float, lr: float = 0.02, weight_decay: float = 1e-4):
+        """Three-factor Hebbian update on KC→MBON edges: Δw = η·e·DA − λw.
+
+        e = eligibility trace laid down when pre spikes and post is depolarized
+            (Hebbian coincidence, decays 0.995 per step). DA = dopamine signal
+            from critic TD-error or raw reward. Only touches plastic_edges
+            (KC→MBON, 66 in synthetic, thousands in MaleCNS). Tested in
+            test_plasticity_path_exists and test_connectome_loader. This is the
+            inner loop (fly's own dopamine), switched off by default
+            (plasticity=False) — outer CEM is 100% of reported results unless
+            explicitly enabled.
+        """
         if not self.plastic_edges:
             return 0
         touched = 0
@@ -410,6 +446,27 @@ class TorchLIFNetwork:
     def clear_inputs(self):
         self.i_ext.zero_()
 
+    def reset_state(self, seed: Optional[int] = None):
+        """Genuine reset — mirrors LIFNetwork.reset_state for torch path."""
+        torch = self._torch
+        if seed is not None:
+            self.rng = random.Random(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                torch.cuda.manual_seed_all(seed)
+        v_init = [self.p.v_rest + self.rng.uniform(-2, 2) for _ in range(self.n)]
+        self.v = torch.tensor(v_init, dtype=torch.float32, device=self.device)
+        self.i_syn.zero_()
+        self.i_ext.zero_()
+        self.refractory.zero_()
+        self.rate_ma.zero_()
+        self.spikes = []
+        self._spike_tensor.zero_()
+        self._spike_idx = None
+        self.t = 0.0
+        if self.plasticity:
+            self.elig.zero_()
+
     def step(self) -> List[int]:
         torch = self._torch
         p = self.p
@@ -497,6 +554,13 @@ class TorchLIFNetwork:
         return float(self.rate_ma.mean().item())
 
     def deliver_dopamine(self, da: float, lr: float = 0.02, weight_decay: float = 1e-4):
+        """Three-factor update — torch path, same equation as Python path.
+
+        See LIFNetwork.deliver_dopamine for full explanation: Δw = η·e·DA − λw
+        on KC→MBON only, eligibility gated. Batched via tensor indexing for
+        GPU; coalesced sparse values updated in-place when possible to avoid
+        rebuilding 125M-edge matrix.
+        """
         if not self.plastic_edges:
             return 0
 

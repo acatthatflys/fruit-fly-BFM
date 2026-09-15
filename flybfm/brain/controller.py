@@ -242,9 +242,25 @@ class ConnectomeController:
             self.stats["plastic_updates"] += touched
         return signal
 
-    def reset(self):
+    def reset(self, seed: Optional[int] = None):
+        """Full episode reset — critic, network state, and observation history.
+
+        Previously only cleared external inputs (clear_inputs) and critic,
+        leaving membrane potentials, synaptic currents, refractory timers,
+        firing-rate moving averages, and spikes from previous episode — causing
+        episode leakage for brain policy (8 episodes per candidate were not
+        independent). Now calls net.reset_state() which reinitializes v,
+        i_syn, refractory, rate_ma, spikes, elig.
+        """
         self.critic.reset()
-        self.net.clear_inputs()
+        # genuine reset if available, else fallback to clear_inputs
+        if hasattr(self.net, "reset_state"):
+            try:
+                self.net.reset_state(seed=seed)
+            except TypeError:
+                self.net.reset_state()
+        else:
+            self.net.clear_inputs()
         self._phi = [0.0] * 22
 
     # ---------------------------------------------------------------- reporting

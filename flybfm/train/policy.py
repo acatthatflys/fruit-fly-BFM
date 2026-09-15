@@ -212,5 +212,14 @@ class BrainPolicyAdapter:
     def __call__(self, me, env) -> Command:
         return self.c.act(me, env)
 
+    def reset(self, seed: Optional[int] = None):
+        """Passthrough so trainer can reset brain state each episode."""
+        if hasattr(self.c, "reset"):
+            try:
+                return self.c.reset(seed=seed)
+            except TypeError:
+                return self.c.reset()
+        return None
+
     def observe_reward(self, phi_next, reward):
         return self.c.observe(phi_next, reward)
