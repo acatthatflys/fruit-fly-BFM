@@ -79,7 +79,8 @@ Output: scenario, result (`blue`/`red`/`draw`), JSON summary, scorecard, first e
 
 ### Viewer (Level -1 works too)
 ```powershell
-python -m flybfm serve --port 8000 --host 0.0.0.0
+python -m flybfm serve --port 8000
+# default --host 127.0.0.1 = localhost only. Use --host 0.0.0.0 to expose on LAN (no auth — anyone on WiFi can start/stop training via /api/train/start|stop).
 ```
 Open **http://localhost:8000/** in Chrome/Edge. You should see 3D fight, ground plane, WEZ bubble. If `web/replays/` empty, generate one with `--replay` above, then click ↻ in header.
 
@@ -162,12 +163,14 @@ $env:NEUPRINT_TOKEN="your_token_here"
 
 `fetch_connectome.py` currently only has `list` / `download` / `prune` — **no slice-to-feather** subcommand. CLI `--brain malecns` is full-download only (expects the 3-file official naming). Don't use `FLYBFM_CONNECTOME` env var for slices — it won't work.
 
-Instead use `load_neuprint()` which returns an in-memory `Connectome`, and pass it directly to `ConnectomeController(connectome)`:
+Instead use `load_neuprint()` which returns an in-memory `Connectome`, and pass it directly to `ConnectomeController(conn=...)`. The controller has **no** `.step(bearing_deg=..., range_m=..., dt=...)` or `.last_groups` — use the low-level loop `probe_brain.py` actually uses:
 
 ```powershell
 python - << 'PY'
 from flybfm.brain.connectome import load_neuprint
 from flybfm.brain.controller import ConnectomeController
+from flybfm.sim.arena import Scenario
+from flybfm.sim.dogfight import Dogfight, EnvConfig
 
 # 1. pull slice live — no files written
 conn = load_neuprint(dataset="male-cns:v1.0",
@@ -177,45 +180,81 @@ conn = load_neuprint(dataset="male-cns:v1.0",
 print(conn.stats())
 # e.g. 2.1k neurons, 180k edges, 1.2k KC->MBON plastic
 
-# 2. use directly — no feather, no env var
-ctrl = ConnectomeController(connectome=conn, plasticity=False)
-# ctrl = ConnectomeController(connectome=conn, plasticity=True) for inner dopamine
-obs = ctrl.reset()
+# 2. use directly — param is conn=, not connectome=
+ctl = ConnectomeController(conn=conn, plasticity=False)
+# ctl = ConnectomeController(conn=conn, plasticity=True) for inner dopamine
+
+# 3. open-loop drive like probe_brain.py does
+env = Dogfight(EnvConfig())
+env.reset(Scenario(range_m=500.0, taa_deg=0.0, nose_offset_deg=-30.0, alt_m=6000.0, seed=0))
+me = env.blue
+other = env.red
+
+groups = ctl._groups()  # DN groups the readout looks at
 for _ in range(250):
-    # dummy visual input: bearing 30°, range 500m
-    obs = ctrl.step(bearing_deg=30.0, range_m=500.0, dt=0.02)
-print("groups:", ctrl.last_groups)
+    ctl.net.clear_inputs()
+    ctl.sensors.inject(ctl.net, me.s, other.s, me.geom_to_other,
+                       getattr(me, "los_rate_rad", 0.0), ctl.net.p.dt)
+    ctl.net.step()
+
+rates = {k: ctl.net.group_rate(v) for k, v in groups.items()}
+print("DN rates:", rates)
+print("pop Hz:", ctl.net.population_rate())
 PY
 ```
 
-Probe with torch, same controller:
+Probe with torch, same low-level loop:
 
 ```powershell
 python - << 'PY'
 from flybfm.brain.connectome import load_neuprint
 from flybfm.brain.controller import ConnectomeController
+from flybfm.sim.arena import Scenario
+from flybfm.sim.dogfight import Dogfight, EnvConfig
+
 conn = load_neuprint(dataset="male-cns:v1.0",
                      cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","DNp26","DNp57","DNp03","DNg02","KC","MBON"])
-ctrl = ConnectomeController(connectome=conn, use_torch=True, plasticity=True)
+ctl = ConnectomeController(conn=conn, use_torch=True, plasticity=True)
+
+env = Dogfight(EnvConfig())
+env.reset(Scenario(range_m=300.0, taa_deg=0.0, nose_offset_deg=-10.0, alt_m=6000.0, seed=1))
+me, other = env.blue, env.red
+
 for _ in range(100):
-    ctrl.step(bearing_deg=10.0, range_m=300.0, dt=0.02)
-print(ctrl.last_groups)
+    ctl.net.clear_inputs()
+    ctl.sensors.inject(ctl.net, me.s, other.s, me.geom_to_other, 0.0, ctl.net.p.dt)
+    ctl.net.step()
+
+print({k: ctl.net.group_rate(v) for k, v in ctl._groups().items()})
 PY
 ```
 
-Fight example (Python, not CLI flag):
+Fight example — use controller directly as policy (no CLI flag):
 
 ```powershell
 python - << 'PY'
 from flybfm.brain.connectome import load_neuprint
 from flybfm.brain.controller import ConnectomeController
-from flybfm.fight import run_fight
-conn = load_neuprint(dataset="male-cns:v1.0", cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","DNp26","DNp57","KC","MBON"])
-brain = ConnectomeController(connectome=conn, use_torch=True)
-result = run_fight(blue=brain, red="level", tag="perch", max_time=30.0, record_replay="web/replays/brain_slice.json")
-print(result)
+from flybfm.train.policy import BrainPolicyAdapter
+from flybfm.sim.arena import CANONICAL_SETUPS
+from flybfm.sim.dogfight import run_match, EnvConfig
+import json, os
+
+conn = load_neuprint(dataset="male-cns:v1.0",
+                     cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","DNp26","DNp57","KC","MBON"])
+ctl = ConnectomeController(conn=conn, use_torch=True)
+brain = BrainPolicyAdapter(ctl)  # wraps act() + reset() + observe_reward()
+
+sc = CANONICAL_SETUPS["perch"]
+_, _, env = run_match(sc, brain, "level", EnvConfig(max_time_s=30.0), record=True)
+os.makedirs("web/replays", exist_ok=True)
+with open("web/replays/brain_slice.json", "w") as fh:
+    json.dump(env.to_replay(), fh)
+print("wrote web/replays/brain_slice.json")
 PY
 ```
+
+
 
 ### Why not env-var feather?
 
@@ -311,9 +350,10 @@ This is the new part (2026-09). `flybfm serve` now has `/api/train/*` and spawns
 ### Terminal 1 — serve
 ```powershell
 cd C:\Users\YourName\Documents\fruit-fly-BFM
-python -m flybfm serve --port 8000 --host 0.0.0.0 --runs-dir runs/live
+python -m flybfm serve --port 8000 --runs-dir runs/live
+# default binds 127.0.0.1 (localhost only). For LAN exposure use --host 0.0.0.0 (no auth on /api/train/* — anyone on network can start/stop jobs).
 # prints:
-# serving ... on http://0.0.0.0:8000/
+# serving ... on http://127.0.0.1:8000/
 #   live training API: POST .../api/train/start
 #   status: GET .../api/train/status
 #   live replay: GET .../api/train/live
@@ -394,6 +434,7 @@ Web uses it for ETA: `total_fights * avg_fight_s *0.75`.
 | pandas not found Level 1/2 | `pip install -e ".[data]"` |
 | PowerShell env vars not persisting | Use `[Environment]::SetEnvironmentVariable(...,"User")` then restart terminal |
 | Port 8000 in use | `python -m flybfm serve --port 8001` |
+| Serve exposed on LAN | Default is now `127.0.0.1` (localhost only). `--host 0.0.0.0` exposes `/api/train/start|stop` with no auth — only use on trusted LAN. |
 | Training already running | `http://localhost:8000/api/train/status` → `running pid` → ■ stop or `taskkill /PID <pid> /T /F` |
 
 ---
@@ -405,7 +446,7 @@ Web uses it for ETA: `total_fights * avg_fight_s *0.75`.
 git clone https://github.com/acatthatflys/fruit-fly-BFM.git; cd fruit-fly-BFM
 pip install -e ".[torch]"; python -m unittest discover -s tests
 python -m flybfm fight --blue guns --red level --tag perch --replay web/replays/perch.json
-python -m flybfm serve --port 8000 --host 0.0.0.0
+python -m flybfm serve --port 8000
 # open http://localhost:8000/ in browser, click ⚙ train → ▶ start training → 👁 watch live fly
 ```
 
