@@ -138,7 +138,7 @@ python -m flybfm train --policy brain --use-torch --generations 3 --population 1
 
 ## Level 1 — Small neural slice via neuPrint (visual→DN, no 1.1 GB download)
 
-**What:** Pull induced subgraph live from neuPrint — only cell types you request, no volumes/skeletons. Real transmitter signs (GABA/GLUT negative), real degree distribution, hundreds-thousands KC→MBON.
+**What:** Pull induced subgraph live from neuPrint — only cell types you request, no volumes/skeletons. Real transmitter signs (GABA/GLUT negative), real degree distribution, hundreds-thousands KC→MBON. **No feather files, no env vars** — uses in-memory `Connectome`.
 
 **Cost:** 100-5k neurons, 10k-500k synapses, 50-200 MB RAM, 0.2-2 s/fight py, 0.5 ms/step torch CPU. Needs free neuPrint account + token.
 
@@ -158,27 +158,88 @@ $env:NEUPRINT_TOKEN="your_token_here"
 [Environment]::SetEnvironmentVariable("NEUPRINT_TOKEN","your_token_here","User")
 ```
 
-### Fetch slice (Python)
+### Fetch slice — correct path (in-memory, no CLI feather cache)
+
+`fetch_connectome.py` currently only has `list` / `download` / `prune` — **no slice-to-feather** subcommand. CLI `--brain malecns` is full-download only (expects the 3-file official naming). Don't use `FLYBFM_CONNECTOME` env var for slices — it won't work.
+
+Instead use `load_neuprint()` which returns an in-memory `Connectome`, and pass it directly to `ConnectomeController(connectome)`:
+
 ```powershell
 python - << 'PY'
 from flybfm.brain.connectome import load_neuprint
+from flybfm.brain.controller import ConnectomeController
+
+# 1. pull slice live — no files written
 conn = load_neuprint(dataset="male-cns:v1.0",
                      cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","VPN",
                                  "DNp26","DNp57","DNp03","DNg02","DNp06","DNa02","DNg13","DNp10","DNHS1",
                                  "KC","MBON","PAM","PPL101"])
 print(conn.stats())
+# e.g. 2.1k neurons, 180k edges, 1.2k KC->MBON plastic
+
+# 2. use directly — no feather, no env var
+ctrl = ConnectomeController(connectome=conn, plasticity=False)
+# ctrl = ConnectomeController(connectome=conn, plasticity=True) for inner dopamine
+obs = ctrl.reset()
+for _ in range(250):
+    # dummy visual input: bearing 30°, range 500m
+    obs = ctrl.step(bearing_deg=30.0, range_m=500.0, dt=0.02)
+print("groups:", ctrl.last_groups)
 PY
 ```
 
-### Or via CLI tools
+Probe with torch, same controller:
+
 ```powershell
-python -m flybfm.tools.fetch_connectome list
-# if you cached a slice as feather:
-$env:FLYBFM_CONNECTOME="data/malecns_pruned/connectome.feather"
-$env:FLYBFM_ANNOTATIONS="data/malecns_pruned/annotations.feather"
-python -m flybfm probe --brain malecns --use-torch --steps 100
-python -m flybfm probe --brain malecns --steps 250 --use-torch --plasticity
+python - << 'PY'
+from flybfm.brain.connectome import load_neuprint
+from flybfm.brain.controller import ConnectomeController
+conn = load_neuprint(dataset="male-cns:v1.0",
+                     cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","DNp26","DNp57","DNp03","DNg02","KC","MBON"])
+ctrl = ConnectomeController(connectome=conn, use_torch=True, plasticity=True)
+for _ in range(100):
+    ctrl.step(bearing_deg=10.0, range_m=300.0, dt=0.02)
+print(ctrl.last_groups)
+PY
 ```
+
+Fight example (Python, not CLI flag):
+
+```powershell
+python - << 'PY'
+from flybfm.brain.connectome import load_neuprint
+from flybfm.brain.controller import ConnectomeController
+from flybfm.fight import run_fight
+conn = load_neuprint(dataset="male-cns:v1.0", cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","DNp26","DNp57","KC","MBON"])
+brain = ConnectomeController(connectome=conn, use_torch=True)
+result = run_fight(blue=brain, red="level", tag="perch", max_time=30.0, record_replay="web/replays/brain_slice.json")
+print(result)
+PY
+```
+
+### Why not env-var feather?
+
+`load_malecns_flat()` derives the neurotransmitter file via string-replace `connectome-weights` → `body-neurotransmitters`, so it only works with the official 3-file naming from `download`:
+- `connectome-weights-male-cns-v1.0-minconf-0.5.feather`
+- `body-annotations-male-cns-v1.0-minconf-0.5.feather`
+- `body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather`
+
+If you write a slice as `connectome.feather` / `annotations.feather`, the replace fails and transmitter signs are missing. That's why Level 1 must stay in-memory.
+
+### Future fix — proposed `fetch-slice` subcommand
+
+Longer-term we will add:
+
+```powershell
+python -m flybfm.tools.fetch_connectome fetch-slice --cell-types R1-R6,T4,T5,LC4,DNp26,DNp57,KC,MBON --out data/slice_pruned --dataset male-cns:v1.0
+# writes:
+#   data/slice_pruned/connectome-weights-male-cns-v1.0-minconf-0.5.feather
+#   data/slice_pruned/body-annotations-male-cns-v1.0-minconf-0.5.feather
+#   data/slice_pruned/body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather
+# with expected naming so load_malecns_flat() works, plus a manifest.json with query
+```
+
+Until then, use the short script above — no `FLYBFM_CONNECTOME` / `FLYBFM_ANNOTATIONS`.
 
 **When to use:** Real wiring without 1.1 GB. Recommended for Track B (connectome vs shuffled).
 
