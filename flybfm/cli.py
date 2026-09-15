@@ -34,7 +34,12 @@ from .sim.scripted import POOL_BY_NAME, default_pool
 
 # --------------------------------------------------------------------- helpers
 def _policy(name: str, seed: int = 0, params=None, basis: str = "linear",
-            use_torch: bool = False, torch_device: str | None = None):
+            use_torch: bool = False, torch_device: str | None = None,
+            brain_kind: str = "synthetic",
+            cell_types: str | None = None,
+            dataset: str = "male-cns:v1.0",
+            neuprint_token: str | None = None,
+            neuprint_server: str = "https://neuprint.janelia.org"):
     if name in POOL_BY_NAME:
         return POOL_BY_NAME[name](seed=seed)
     if name == "random":
@@ -45,15 +50,25 @@ def _policy(name: str, seed: int = 0, params=None, basis: str = "linear",
         if name == "poly" or basis == "poly":
             return PolyPolicy(params=params, seed=seed) if params else PolyPolicy(seed=seed)
         return FeaturePolicy(params=params, seed=seed) if params else FeaturePolicy(seed=seed)
-    if name in ("brain", "connectome"):
+    if name in ("brain", "connectome", "synthetic", "malecns", "neuprint"):
         from .brain.controller import build_controller, ReadoutParams
-        c = build_controller("synthetic", seed=seed,
+        # allow --blue brain --brain synthetic|malecns|neuprint  or direct --blue neuprint
+        kind = brain_kind
+        if name in ("synthetic", "malecns", "neuprint"):
+            kind = name
+        # parse cell_types csv if provided
+        ct_list = None
+        if cell_types:
+            ct_list = [s.strip() for s in cell_types.split(",") if s.strip()]
+        c = build_controller(kind, seed=seed,
                              readout=ReadoutParams.from_vector(params) if params else None,
-                             use_torch=use_torch, torch_device=torch_device)
+                             use_torch=use_torch, torch_device=torch_device,
+                             cell_types=ct_list, dataset=dataset,
+                             token=neuprint_token or "", server=neuprint_server)
         from .train.policy import BrainPolicyAdapter
         return BrainPolicyAdapter(c)
     raise SystemExit(f"unknown policy '{name}' (try: {', '.join(sorted(POOL_BY_NAME))}, "
-                     f"random, features, brain)")
+                     f"random, features, brain, synthetic, malecns, neuprint)")
 
 
 def _scenario(tag: str, seed: int, random_space: bool) -> Scenario:
@@ -112,8 +127,22 @@ def _bench_time_per_fight(n_fights: int = 8, max_time_s: float = 60.0, decision_
 # ------------------------------------------------------------------- commands
 def cmd_fight(args) -> int:
     bck, rck = _load_checkpoint(args.blue_ckpt), _load_checkpoint(args.red_ckpt)
-    blue = _policy(args.blue, seed=1, params=bck["params"], basis=bck["basis"])
-    red = _policy(args.red, seed=2, params=rck["params"], basis=rck["basis"])
+    blue = _policy(args.blue, seed=1, params=bck["params"], basis=bck["basis"],
+                   use_torch=getattr(args, "use_torch", False),
+                   torch_device=getattr(args, "torch_device", None),
+                   brain_kind=getattr(args, "brain", "synthetic"),
+                   cell_types=getattr(args, "cell_types", None),
+                   dataset=getattr(args, "dataset", "male-cns:v1.0"),
+                   neuprint_token=getattr(args, "neuprint_token", None),
+                   neuprint_server=getattr(args, "neuprint_server", "https://neuprint.janelia.org"))
+    red = _policy(args.red, seed=2, params=rck["params"], basis=rck["basis"],
+                  use_torch=getattr(args, "use_torch", False),
+                  torch_device=getattr(args, "torch_device", None),
+                  brain_kind=getattr(args, "brain", "synthetic"),
+                  cell_types=getattr(args, "cell_types", None),
+                  dataset=getattr(args, "dataset", "male-cns:v1.0"),
+                  neuprint_token=getattr(args, "neuprint_token", None),
+                  neuprint_server=getattr(args, "neuprint_server", "https://neuprint.janelia.org"))
     scen = _scenario(args.tag, args.seed, args.random)
     cfg = EnvConfig(decision_dt=args.decision_dt, max_time_s=args.max_time)
     info, trace, env = run_match(scen, blue, red, cfg)
@@ -143,10 +172,18 @@ def cmd_train(args) -> int:
         from .brain.controller import build_controller
         use_torch = getattr(args, "use_torch", False)
         torch_device = getattr(args, "torch_device", None)
-        ctl = build_controller("synthetic", seed=args.seed, use_torch=use_torch, torch_device=torch_device)
+        brain_kind = getattr(args, "brain", "synthetic")
+        cell_types_str = getattr(args, "cell_types", None)
+        ct_list = [s.strip() for s in cell_types_str.split(",") if s.strip()] if cell_types_str else None
+        dataset = getattr(args, "dataset", "male-cns:v1.0")
+        neuprint_token = getattr(args, "neuprint_token", None)
+        neuprint_server = getattr(args, "neuprint_server", "https://neuprint.janelia.org")
+        ctl = build_controller(brain_kind, seed=args.seed, use_torch=use_torch, torch_device=torch_device,
+                               cell_types=ct_list, dataset=dataset, token=neuprint_token or "", server=neuprint_server)
         proto = BrainPolicyAdapter(ctl)
-        factory = lambda p: BrainPolicyAdapter(
-            build_controller("synthetic", seed=args.seed, use_torch=use_torch, torch_device=torch_device)
+        factory = lambda p, _bk=brain_kind, _ct=ct_list, _ds=dataset, _tok=neuprint_token, _srv=neuprint_server: BrainPolicyAdapter(
+            build_controller(_bk, seed=args.seed, use_torch=use_torch, torch_device=torch_device,
+                             cell_types=_ct, dataset=_ds, token=_tok or "", server=_srv)
         ).with_params(p)
         init = proto.params
     elif args.policy == "features":
@@ -718,8 +755,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     f = sub.add_parser("fight", help="run one 1v1 guns-only engagement")
-    f.add_argument("--blue", default="guns")
-    f.add_argument("--red", default="instructor")
+    f.add_argument("--blue", default="guns", help="blue policy: guns, random, features, brain, synthetic, malecns, neuprint, or any scripted name")
+    f.add_argument("--red", default="instructor", help="red policy")
     f.add_argument("--tag", default="head_on")
     f.add_argument("--random", action="store_true", help="ignore --tag, sample a random start")
     f.add_argument("--seed", type=int, default=0)
@@ -728,6 +765,13 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--blue-ckpt", default=None)
     f.add_argument("--red-ckpt", default=None)
     f.add_argument("--replay", default=None)
+    f.add_argument("--brain", default="synthetic", choices=["synthetic", "malecns", "neuprint"], help="brain kind when --blue/--red is brain/synthetic/malecns/neuprint")
+    f.add_argument("--cell-types", default=None, help="comma-separated cell types for --brain neuprint (Level 1 slice), e.g. R1-R6,T4,T5,DNp26,DNp57,KC,MBON")
+    f.add_argument("--dataset", default="male-cns:v1.0", help="neuprint dataset for --brain neuprint")
+    f.add_argument("--neuprint-token", default=None, help="neuprint token, or set NEUPRINT_TOKEN env var")
+    f.add_argument("--neuprint-server", default="https://neuprint.janelia.org", help="neuprint server URL")
+    f.add_argument("--use-torch", action="store_true", help="use TorchLIFNetwork for brain policy")
+    f.add_argument("--torch-device", default=None, help="torch device")
     f.set_defaults(func=cmd_fight)
 
     t = sub.add_parser("train", help="train a policy by CEM/ES")
@@ -777,6 +821,11 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--use-torch", action="store_true", help="use TorchLIFNetwork (CPU/CUDA) for brain policy — required for full CNS")
     t.add_argument("--torch-device", default=None, help="torch device: cpu, cuda, cuda:0, etc (auto-detect if omitted)")
     t.add_argument("--plasticity", action="store_true", help="enable inner KC->MBON dopamine-gated plasticity (off by default; 0%% of reported results use it)")
+    t.add_argument("--brain", default="synthetic", choices=["synthetic", "malecns", "neuprint"], help="brain kind for --policy brain: synthetic (default), malecns (flat files), neuprint (Level 1 live slice)")
+    t.add_argument("--cell-types", default=None, help="comma-separated cell types for --brain neuprint")
+    t.add_argument("--dataset", default="male-cns:v1.0", help="neuprint dataset")
+    t.add_argument("--neuprint-token", default=None, help="neuprint token")
+    t.add_argument("--neuprint-server", default="https://neuprint.janelia.org", help="neuprint server URL")
     t.set_defaults(func=cmd_train)
 
     e = sub.add_parser("eval", help="evaluate a checkpoint on held-out setups")
@@ -806,13 +855,17 @@ def build_parser() -> argparse.ArgumentParser:
     gn.set_defaults(func=cmd_gunnery)
 
     pr = sub.add_parser("probe", help="measure what the connectome brain encodes")
-    pr.add_argument("--brain", default="synthetic", choices=["synthetic", "malecns"])
+    pr.add_argument("--brain", default="synthetic", choices=["synthetic", "malecns", "neuprint"], help="brain kind: synthetic (default), malecns (full flat files), neuprint (Level 1 live slice)")
     pr.add_argument("--seed", type=int, default=2)
     pr.add_argument("--steps", type=int, default=250)
     pr.add_argument("--out", default=None)
     pr.add_argument("--use-torch", action="store_true", help="use TorchLIFNetwork (CPU/CUDA) — ~10-100x faster, needed for full CNS")
     pr.add_argument("--torch-device", default=None, help="torch device: cpu, cuda, etc")
     pr.add_argument("--plasticity", action="store_true", help="enable KC->MBON plasticity (off by default)")
+    pr.add_argument("--cell-types", default=None, help="comma-separated cell types for --brain neuprint, e.g. R1-R6,T4,T5,DNp26,DNp57,KC,MBON")
+    pr.add_argument("--dataset", default="male-cns:v1.0", help="neuprint dataset for --brain neuprint")
+    pr.add_argument("--neuprint-token", default=None, help="neuprint token, or set NEUPRINT_TOKEN env var")
+    pr.add_argument("--neuprint-server", default="https://neuprint.janelia.org", help="neuprint server URL")
     pr.set_defaults(func=cmd_probe)
 
     rp = sub.add_parser("replay", help="rebuild the web viewer manifest")
