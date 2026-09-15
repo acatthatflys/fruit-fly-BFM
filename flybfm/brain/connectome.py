@@ -444,7 +444,52 @@ def load_malecns_flat(connectome_path: str, annotations_path: str,
         ) from exc
 
     ann = pd.read_feather(annotations_path)
-    tx = pd.read_feather(connectome_path.replace("connectome-weights", "body-neurotransmitters"))
+
+    # --- transmitter file: handle both naming variants ---
+    # FILES lists body-neurotransmitters-male-cns-v1.0.feather (no minconf)
+    # but old code assumed body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather
+    # via replace. Try robust detection.
+    import os
+    tx_path = None
+    # 1) try directory scan for any body-neurotransmitters*.feather
+    dir_name = os.path.dirname(connectome_path) or "."
+    if os.path.isdir(dir_name):
+        for fn in os.listdir(dir_name):
+            if fn.startswith("body-neurotransmitters") and fn.endswith(".feather"):
+                tx_path = os.path.join(dir_name, fn)
+                break
+    # 2) try replace variants
+    if tx_path is None:
+        candidates = [
+            connectome_path.replace("connectome-weights", "body-neurotransmitters"),
+            connectome_path.replace("connectome-weights-male-cns-v1.0-minconf-0.5", "body-neurotransmitters-male-cns-v1.0"),
+            connectome_path.replace("connectome-weights", "body-neurotransmitters-male-cns-v1.0"),
+            os.path.join(dir_name, "body-neurotransmitters-male-cns-v1.0.feather"),
+            os.path.join(dir_name, "body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather"),
+        ]
+        for cand in candidates:
+            if os.path.exists(cand):
+                tx_path = cand
+                break
+    # 3) fallback: if still not found, try same dir as annotations
+    if tx_path is None:
+        ann_dir = os.path.dirname(annotations_path) or "."
+        if os.path.isdir(ann_dir):
+            for fn in os.listdir(ann_dir):
+                if fn.startswith("body-neurotransmitters") and fn.endswith(".feather"):
+                    tx_path = os.path.join(ann_dir, fn)
+                    break
+    if tx_path is None:
+        # If transmitter file missing, proceed without it — default ACH
+        tx = None
+    else:
+        tx = pd.read_feather(tx_path)
+
+    # Support JSONL pruned output as well (see fetch_connectome prune)
+    if connectome_path.endswith(".jsonl") or annotations_path.endswith(".jsonl"):
+        # delegate to jsonl loader
+        return load_pruned_jsonl(connectome_path, annotations_path, min_synapses=min_synapses, weight_fn=weight_fn)
+
     con = pd.read_feather(connectome_path)
 
     def pick(df, *names):
@@ -453,22 +498,43 @@ def load_malecns_flat(connectome_path: str, annotations_path: str,
                 return n
         raise KeyError(f"none of {names} in columns {list(df.columns)}")
 
-    id_col = pick(ann, "bodyId", "body_id", "id")
-    type_col = pick(ann, "cell_type", "type", "primary_type")
-    side_col = pick(ann, "side", "side_predicted")
-    tx_col = pick(tx, "transmitter", "nt_type", "top_nt")
-    pre_col = pick(con, "pre", "bodyId_pre", "pre_bodyId")
-    post_col = pick(con, "post", "bodyId_post", "post_bodyId")
-    w_col = pick(con, "weight", "syn_count", "count")
+    id_col = pick(ann, "bodyId", "body_id", "body_id", "id", "bodyId_pre", "body_pre")
+    type_col = pick(ann, "cell_type", "type", "primary_type", "cellType", "instance_type")
+    # Fix annotation schema mismatch: actual dataset has somaSide, rootSide
+    side_col = pick(ann, "side", "side_predicted", "somaSide", "rootSide", "soma_side", "root_side", "somaSide_predicted")
+    if tx is not None:
+        tx_col = pick(tx, "transmitter", "nt_type", "top_nt", "neurotransmitter", "predicted_nt")
+        # tx id col may be bodyId or id
+        try:
+            tx_id_col = pick(tx, "bodyId", "body_id", "id")
+        except KeyError:
+            tx_id_col = id_col if id_col in tx.columns else list(tx.columns)[0]
+    else:
+        tx_col = None
+        tx_id_col = None
+    # Fix edge schema: actual current files use body_pre, body_post, weight
+    pre_col = pick(con, "body_pre", "bodyId_pre", "pre", "pre_bodyId", "bodyId_pre")
+    post_col = pick(con, "body_post", "bodyId_post", "post", "post_bodyId", "bodyId_post")
+    w_col = pick(con, "weight", "syn_count", "count", "synapses", "size")
 
     ids = list(ann[id_col])
     index = {b: i for i, b in enumerate(ids)}
     c = Connectome(ids=ids, types=[str(t) for t in ann[type_col]],
                    sides=[str(s) for s in ann[side_col]],
                    transmitter=[""] * len(ids))
-    txmap = dict(zip(tx[id_col], tx[tx_col]))
-    for i, b in enumerate(ids):
-        c.transmitter[i] = str(txmap.get(b, "ACH"))
+    if tx is not None and tx_col is not None:
+        # tx may have different id column name
+        try:
+            tx_ids = list(tx[tx_id_col]) if tx_id_col in tx.columns else list(tx[id_col])
+        except Exception:
+            tx_ids = list(tx.iloc[:,0])
+        tx_vals = list(tx[tx_col])
+        txmap = dict(zip(tx_ids, tx_vals))
+        for i, b in enumerate(ids):
+            c.transmitter[i] = str(txmap.get(b, "ACH"))
+    else:
+        for i in range(len(ids)):
+            c.transmitter[i] = "ACH" 
 
     if weight_fn is None:
         def weight_fn(n, pre_tx, post_tx):
@@ -483,6 +549,107 @@ def load_malecns_flat(connectome_path: str, annotations_path: str,
         c.pre.append(ia)
         c.post.append(ib)
         c.weight.append(weight_fn(n, c.transmitter[ia], c.transmitter[ib]))
+    return _apply_transmitter_signs(c)
+
+
+def load_pruned_jsonl(connectome_path: str, annotations_path: str,
+                      min_synapses: int = 1,
+                      weight_fn=None) -> Connectome:
+    """Load the compact JSONL output of `fetch_connectome prune`.
+
+    prune writes:
+      flight_subgraph.jsonl  {id, type, side}
+      flight_edges.jsonl     {pre, post, w}  where pre/post are bodyIds
+
+    This loader makes that output runnable: build_controller() now reads it
+    if FLYBFM_CONNECTOME points to flight_edges.jsonl and FLYBFM_ANNOTATIONS
+    to flight_subgraph.jsonl. Previously prune was disconnected from runtime.
+    """
+    import json
+    import os
+    # annotations_path should be flight_subgraph.jsonl, connectome_path flight_edges.jsonl
+    # but allow either order: detect which file contains 'id' vs 'pre'
+    ann_path = annotations_path
+    edge_path = connectome_path
+    # If user passed them swapped, try to auto-detect
+    def sniff(p):
+        try:
+            with open(p) as fh:
+                first = fh.readline()
+                if not first:
+                    return "unknown"
+                obj = json.loads(first)
+                if "id" in obj and "type" in obj:
+                    return "ann"
+                if "pre" in obj and "post" in obj:
+                    return "edge"
+        except Exception:
+            pass
+        return "unknown"
+    # if edge_path looks like ann and ann_path looks like edge, swap
+    if os.path.exists(edge_path) and os.path.exists(ann_path):
+        s_edge = sniff(edge_path)
+        s_ann = sniff(ann_path)
+        if s_edge == "ann" and s_ann == "edge":
+            ann_path, edge_path = edge_path, ann_path
+
+    ids = []
+    types = []
+    sides = []
+    id_to_idx = {}
+    with open(ann_path) as fh:
+        for line in fh:
+            line=line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            bid = int(obj["id"])
+            id_to_idx[bid] = len(ids)
+            ids.append(bid)
+            types.append(str(obj.get("type", "unknown")))
+            sides.append(str(obj.get("side", "C")))
+
+    c = Connectome(ids=ids, types=types, sides=sides, transmitter=["ACH"]*len(ids))
+
+    if weight_fn is None:
+        def weight_fn(n, pre_tx, post_tx):
+            return min(3.0, max(0.05, float(n) ** 0.5 * 0.15))
+
+    with open(edge_path) as fh:
+        for line in fh:
+            line=line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            # support both bodyId and idx formats
+            pre_raw = obj.get("pre")
+            post_raw = obj.get("post")
+            w_raw = obj.get("w", obj.get("weight", 1))
+            if float(w_raw) < min_synapses:
+                continue
+            # if pre/post are already indices (small), keep; if bodyIds (large), map
+            if pre_raw in id_to_idx and post_raw in id_to_idx:
+                ia = id_to_idx[pre_raw]
+                ib = id_to_idx[post_raw]
+            else:
+                # assume they are already indices or direct bodyIds that were mapped
+                # try mapping, fallback to raw if within range
+                ia = id_to_idx.get(pre_raw)
+                ib = id_to_idx.get(post_raw)
+                if ia is None or ib is None:
+                    # maybe file already uses 0-based indices
+                    try:
+                        ia_int = int(pre_raw)
+                        ib_int = int(post_raw)
+                        if 0 <= ia_int < len(ids) and 0 <= ib_int < len(ids):
+                            ia, ib = ia_int, ib_int
+                        else:
+                            continue
+                    except Exception:
+                        continue
+            c.pre.append(ia)
+            c.post.append(ib)
+            c.weight.append(weight_fn(w_raw, "ACH", "ACH"))
     return _apply_transmitter_signs(c)
 
 

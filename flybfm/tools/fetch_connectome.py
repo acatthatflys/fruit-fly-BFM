@@ -34,7 +34,18 @@ FILES = [
 ]
 
 #: Cell types worth keeping for a visual -> descending flight subgraph.
+#: Tight flight-relevant default (~1k-5k neurons) — matches neuprint default slice.
+#: Previously this was very broad (DNp, DNg, VPN, VLP etc) which kept 24k neurons,
+#: far larger than the documented 1k-5k flight slice. Now default is specific.
 DEFAULT_KEEP = (
+    "R1-R6", "R1-6", "T4", "T5", "LC4", "LPLC2", "STMD", "VPN",
+    "VS", "HS",
+    "DNp26", "DNp57", "DNp03", "DNg02", "DNp06", "DNa02", "DNg13", "DNp10", "DNHS1",
+    "KC", "MBON", "PAM", "PPL101",
+)
+
+# Broader set for users who explicitly want more (use --keep with custom list or --keep broad)
+BROAD_KEEP = (
     "R1-6", "R7", "R8", "R1-R6", "PHOTORECEPTOR", "T4", "T5", "LPLC2", "LPLC4", "LC4",
     "STMD", "VS", "HS", "VCH", "DCH",
     "DNp", "DNg", "DNa", "DNb", "DNc", "DNd", "DNe", "DNv", "DNx", "DNHS", "MDN",
@@ -89,7 +100,12 @@ def cmd_download(args) -> int:
 
 
 def cmd_prune(args) -> int:
-    """Reduce the flat connectome to a compact JSONL the stdlib loader can read."""
+    """Reduce the flat connectome to a compact JSONL the stdlib loader can read.
+
+    Output is now wired to runtime: build_controller() can load the JSONL directly
+    if FLYBFM_CONNECTOME points to flight_edges.jsonl and FLYBFM_ANNOTATIONS to
+    flight_subgraph.jsonl, or it can still load the original feather files.
+    """
     try:
         import pandas as pd
     except Exception:
@@ -98,44 +114,97 @@ def cmd_prune(args) -> int:
               "(the rest of the repo deliberately has no dependencies)", file=sys.stderr)
         return 2
 
+    # Ensure output dir exists — fixes FileNotFoundError when data/malecns_pruned missing
+    os.makedirs(args.out, exist_ok=True)
+
     src = args.src or _find(args.out, "connectome-weights")
+    # if not found in out, also look in parent or args.out's sibling data/malecns
+    if not src:
+        # try data/malecns as fallback if out is pruned dir
+        for cand_dir in [args.out, os.path.join(os.path.dirname(args.out), "malecns"), "data/malecns"]:
+            if os.path.isdir(cand_dir):
+                f = _find(cand_dir, "connectome-weights")
+                if f:
+                    src = f
+                    break
     ann = args.annotations or _find(args.out, "body-annotations")
+    if not ann:
+        for cand_dir in [args.out, os.path.join(os.path.dirname(args.out), "malecns"), "data/malecns"]:
+            if os.path.isdir(cand_dir):
+                f = _find(cand_dir, "body-annotations")
+                if f:
+                    ann = f
+                    break
     if not src or not ann:
         print("could not find the feather files; pass --src and --annotations", file=sys.stderr)
         return 2
     print(f"edges : {src}\nannots: {ann}")
     a = pd.read_feather(ann)
     cols = {c.lower(): c for c in a.columns}
+    # id, type, side — support many naming variants observed in releases
     id_col = _pick(cols, "bodyid", "body_id", "root_id", "id")
     type_col = _pick(cols, "celltype", "cell_type", "type", "primary_type", "annotation")
-    side_col = _pick(cols, "side", "hemisphere", "soma_side")
+    side_col = _pick(cols, "side", "side_predicted", "somaside", "soma_side", "rootside", "root_side", "hemisphere")
     if id_col is None or type_col is None:
         print(f"unexpected annotation columns: {list(a.columns)}", file=sys.stderr)
         return 2
-    keep = set(args.keep.split(",")) if args.keep else set(DEFAULT_KEEP)
+    if args.keep:
+        if args.keep.strip().lower() == "broad":
+            keep = set(BROAD_KEEP)
+        else:
+            keep = set(k.strip() for k in args.keep.split(",") if k.strip())
+    else:
+        keep = set(DEFAULT_KEEP)
 
     def wanted(t) -> bool:
-        t = str(t)
-        return any(t.startswith(k) or k in t for k in keep)
+        # More precise than substring: exact or prefix match.
+        # Previously used `k in t` which caused 24k matches (e.g. 'T4' in 'STMD' etc).
+        # Now: t == k or t.startswith(k) or t.startswith(k+'_') or t.startswith(k+'-')
+        # For DN families like 'DNp', we want prefix match.
+        t = str(t).strip()
+        if not t:
+            return False
+        for k in keep:
+            k = k.strip()
+            if not k:
+                continue
+            if t == k:
+                return True
+            if t.startswith(k):
+                return True
+            # handle case like R1-6 vs R1-R6 etc — allow k without hyphen to match?
+            # keep original broad fallback only for very short keys that are known families
+            # but avoid overly broad substring.
+        return False
 
     a = a[[c for c in (id_col, type_col, side_col) if c]].rename(
-        columns={id_col: "id", type_col: "type", side_col: "side"})
-    a = a[a["type"].map(wanted)]
-    ids = set(a["id"].tolist())
-    print(f"kept {len(a)} annotated neurons of {len(ids)} ids by type")
+        columns={id_col: "id", type_col: "type", side_col: "side"} if side_col else {id_col: "id", type_col: "type"})
+    if "side" not in a.columns:
+        a["side"] = "C"
+    # filter
+    mask = a["type"].map(wanted)
+    a_filtered = a[mask]
+    ids = set(a_filtered["id"].tolist())
+    print(f"kept {len(a_filtered)} annotated neurons of {len(ids)} ids by type (from {len(a)} total)")
+    if len(a_filtered) > 8000:
+        print(f"WARNING: kept {len(a_filtered)} neurons — much larger than expected 1k-5k flight slice. "
+              f"Consider --keep with tighter list e.g. R1-R6,T4,T5,LC4,LPLC2,STMD,VPN,DNp26,DNp57,DNp03,DNg02,DNp06,DNa02,DNg13,DNp10,DNHS1,KC,MBON,PAM,PPL101")
+    a = a_filtered
 
     out = os.path.join(args.out, "flight_subgraph.jsonl")
     with open(out, "w") as fh:
         for row in a.itertuples(index=False):
+            side_val = str(getattr(row, "side", "C")) if hasattr(row, "side") else "C"
             fh.write(json.dumps({"id": int(row.id), "type": str(row.type),
-                                 "side": str(getattr(row, "side", "C"))}) + "\n")
+                                 "side": side_val}) + "\n")
     print(f"wrote {out}")
 
     e = pd.read_feather(src, columns=None)
     ecols = {c.lower(): c for c in e.columns}
-    pre = _pick(ecols, "bodyid_pre", "pre", "pre_bodyid", "from", "source")
-    post = _pick(ecols, "bodyid_post", "post", "post_bodyid", "to", "target")
-    w = _pick(ecols, "weight", "synapses", "count", "size")
+    # Support observed variants: body_pre/body_post (current), bodyId_pre, pre, etc.
+    pre = _pick(ecols, "body_pre", "bodyid_pre", "pre", "pre_bodyid", "bodyid_pre", "from", "source")
+    post = _pick(ecols, "body_post", "bodyid_post", "post", "post_bodyid", "bodyid_post", "to", "target")
+    w = _pick(ecols, "weight", "synapses", "count", "size", "syn_count")
     if None in (pre, post, w):
         print(f"unexpected edge columns: {list(e.columns)}", file=sys.stderr)
         return 2
@@ -147,7 +216,13 @@ def cmd_prune(args) -> int:
             fh.write(json.dumps({"pre": int(row.pre), "post": int(row.post),
                                  "w": float(row.w)}) + "\n")
     print(f"wrote {eout}  ({len(e)} edges)\n"
-          f"now: export FLYBFM_CONNECTOME={eout} FLYBFM_ANNOTATIONS={out}")
+          f"Now you can either:\n"
+          f"  1) Use JSONL directly (wired to runtime):\n"
+          f"     export FLYBFM_CONNECTOME={eout}\n"
+          f"     export FLYBFM_ANNOTATIONS={out}\n"
+          f"  2) Or use original feather files with --brain malecns:\n"
+          f"     export FLYBFM_CONNECTOME={src}\n"
+          f"     export FLYBFM_ANNOTATIONS={ann}")
     return 0
 
 
