@@ -304,11 +304,23 @@ def build_controller(kind: str = "connectome", seed: int = 0,
         if not (con_path and ann_path):
             raise RuntimeError(
                 "Set FLYBFM_CONNECTOME and FLYBFM_ANNOTATIONS to the MaleCNS "
-                "feather files (see tools/fetch_connectome.py), or use "
-                "--brain synthetic or --brain neuprint."
+                "feather files (see tools/fetch_connectome.py), or to the pruned "
+                "JSONL files (flight_edges.jsonl + flight_subgraph.jsonl), "
+                "or use --brain synthetic or --brain neuprint."
             )
-        from .connectome import load_malecns_flat
-        conn = flight_subgraph(load_malecns_flat(con_path, ann_path))
+        # If either path is JSONL (pruned output), use the JSONL loader — now wired to runtime
+        if con_path.endswith(".jsonl") or ann_path.endswith(".jsonl"):
+            try:
+                from .connectome import load_pruned_jsonl
+                conn = load_pruned_jsonl(con_path, ann_path)
+            except Exception as exc:
+                # fallback to flat loader which also handles jsonl
+                from .connectome import load_malecns_flat
+                conn = load_malecns_flat(con_path, ann_path)
+        else:
+            from .connectome import load_malecns_flat
+            conn = load_malecns_flat(con_path, ann_path)
+        conn = flight_subgraph(conn)
     elif kind in ("neuprint", "neuprint_slice", "slice"):
         from .connectome import load_neuprint
         # default flight-relevant slice if caller didn't specify

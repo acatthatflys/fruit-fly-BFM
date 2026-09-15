@@ -288,31 +288,24 @@ PY
 
 
 
-### Why not env-var feather?
+### Prune tool fixes (2026-09)
 
-`load_malecns_flat()` derives the neurotransmitter file via string-replace `connectome-weights` → `body-neurotransmitters`, so it only works with the official 3-file naming from `download`:
-- `connectome-weights-male-cns-v1.0-minconf-0.5.feather`
-- `body-annotations-male-cns-v1.0-minconf-0.5.feather`
-- `body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather`
+Previously `prune` had 4 issues reported:
+1. **Output dir not created** → `FileNotFoundError: data\malecns_pruned\flight_subgraph.jsonl` — fixed with `os.makedirs(out_dir, exist_ok=True)`.
+2. **Schema warning** `unexpected edge columns: ['body_pre','body_post','weight']` — loader now accepts `body_pre`/`body_post` (current MaleCNS) plus `bodyId_pre`/`pre` etc.
+3. **Prune output disconnected** — `flight_subgraph.jsonl` was never read by `build_controller()` — now wired: if `FLYBFM_CONNECTOME` points to `flight_edges.jsonl` and `FLYBFM_ANNOTATIONS` to `flight_subgraph.jsonl`, controller loads via `load_pruned_jsonl()`. Feather path still works.
+4. **Flight subgraph size 24k vs expected 1k-5k** — old `wanted()` used `k in t` substring which matched far too broadly (e.g. `T4` in `STMD`). Now uses exact or prefix match, and default `DEFAULT_KEEP` is tight flight-relevant set: `R1-R6,T4,T5,LC4,LPLC2,STMD,VPN,VS,HS,DNp26,DNp57,DNp03,DNg02,DNp06,DNa02,DNg13,DNp10,DNHS1,KC,MBON,PAM,PPL101` (~1k-5k). Use `--keep broad` for old broad behavior or custom CSV.
 
-If you write a slice as `connectome.feather` / `annotations.feather`, the replace fails and transmitter signs are missing. That's why Level 1 must stay in-memory.
+### Loader fixes (2026-09)
 
-### Future fix — proposed `fetch-slice` subcommand
+`load_malecns_flat()` now handles:
+- **Transmitter filename**: both `body-neurotransmitters-male-cns-v1.0.feather` (current, no minconf) and `body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather` (old) via directory scan + fallback list. No longer crashes on fresh download.
+- **Annotation schema**: accepts `side`, `side_predicted`, `somaSide`, `rootSide`, `soma_side`, `root_side`, `hemisphere` — fixes crash where dataset has `somaSide`/`rootSide`.
+- **Edge schema**: accepts `body_pre`/`body_post`/`weight` (current) plus older variants.
 
-Longer-term we will add:
+If transmitter file missing, defaults to `ACH` (excitatory) rather than crash.
 
-```powershell
-python -m flybfm.tools.fetch_connectome fetch-slice --cell-types R1-R6,T4,T5,LC4,DNp26,DNp57,KC,MBON --out data/slice_pruned --dataset male-cns:v1.0
-# writes:
-#   data/slice_pruned/connectome-weights-male-cns-v1.0-minconf-0.5.feather
-#   data/slice_pruned/body-annotations-male-cns-v1.0-minconf-0.5.feather
-#   data/slice_pruned/body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather
-# with expected naming so load_malecns_flat() works, plus a manifest.json with query
-```
-
-Until then, use the short script above — no `FLYBFM_CONNECTOME` / `FLYBFM_ANNOTATIONS`.
-
-**When to use:** Real wiring without 1.1 GB. Recommended for Track B (connectome vs shuffled).
+**When to use Level 1:** Real wiring without 1.1 GB. Recommended for Track B (connectome vs shuffled). CLI `--brain neuprint` is easiest; Python `load_neuprint()` or pruned JSONL both work.
 
 ---
 
@@ -342,9 +335,23 @@ dir data/malecns_pruned
 ```
 
 ### Set env vars (PowerShell, session)
+
+Prune now creates `data/malecns_pruned/flight_subgraph.jsonl` + `flight_edges.jsonl` and auto-creates the dir.
+
+Two ways to use pruned output (both wired to runtime):
+
 ```powershell
+# Option A — JSONL directly (lightweight, no pandas at runtime)
+$env:FLYBFM_CONNECTOME="data/malecns_pruned/flight_edges.jsonl"
+$env:FLYBFM_ANNOTATIONS="data/malecns_pruned/flight_subgraph.jsonl"
+
+# Option B — original feather files (needs pandas at runtime)
 $env:FLYBFM_CONNECTOME="data/malecns_pruned/connectome-weights-male-cns-v1.0-minconf-0.5.feather"
 $env:FLYBFM_ANNOTATIONS="data/malecns_pruned/body-annotations-male-cns-v1.0-minconf-0.5.feather"
+# or if you kept originals in data/malecns:
+# $env:FLYBFM_CONNECTOME="data/malecns/connectome-weights-male-cns-v1.0-minconf-0.5.feather"
+# $env:FLYBFM_ANNOTATIONS="data/malecns/body-annotations-male-cns-v1.0-minconf-0.5.feather"
+
 # persist:
 [Environment]::SetEnvironmentVariable("FLYBFM_CONNECTOME",$env:FLYBFM_CONNECTOME,"User")
 [Environment]::SetEnvironmentVariable("FLYBFM_ANNOTATIONS",$env:FLYBFM_ANNOTATIONS,"User")
@@ -486,9 +493,13 @@ For full MaleCNS (Level 2):
 ```powershell
 pip install -e ".[all]"
 python -m flybfm.tools.fetch_connectome download --out data/malecns
-python -m flybfm.tools.fetch_connectome prune --source data/malecns --out data/malecns_pruned
-$env:FLYBFM_CONNECTOME="data/malecns_pruned/connectome-weights-male-cns-v1.0-minconf-0.5.feather"
-$env:FLYBFM_ANNOTATIONS="data/malecns_pruned/body-annotations-male-cns-v1.0-minconf-0.5.feather"
+python -m flybfm.tools.fetch_connectome prune --out data/malecns_pruned
+# JSONL wired to runtime (no pandas needed at runtime):
+$env:FLYBFM_CONNECTOME="data/malecns_pruned/flight_edges.jsonl"
+$env:FLYBFM_ANNOTATIONS="data/malecns_pruned/flight_subgraph.jsonl"
+# or feather:
+# $env:FLYBFM_CONNECTOME="data/malecns/connectome-weights-male-cns-v1.0-minconf-0.5.feather"
+# $env:FLYBFM_ANNOTATIONS="data/malecns/body-annotations-male-cns-v1.0-minconf-0.5.feather"
 python -m flybfm probe --brain malecns --use-torch --steps 250
 python -m flybfm serve --port 8000
 ```
