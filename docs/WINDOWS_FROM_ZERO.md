@@ -159,11 +159,43 @@ $env:NEUPRINT_TOKEN="your_token_here"
 [Environment]::SetEnvironmentVariable("NEUPRINT_TOKEN","your_token_here","User")
 ```
 
-### Fetch slice — correct path (in-memory, no CLI feather cache)
+### CLI — `--brain neuprint` (Level 1 wired, no feather cache)
 
-`fetch_connectome.py` currently only has `list` / `download` / `prune` — **no slice-to-feather** subcommand. CLI `--brain malecns` is full-download only (expects the 3-file official naming). Don't use `FLYBFM_CONNECTOME` env var for slices — it won't work.
+`load_neuprint()` is now wired into the CLI. No 1.1 GB download, no `FLYBFM_CONNECTOME` env var.
 
-Instead use `load_neuprint()` which returns an in-memory `Connectome`, and pass it directly to `ConnectomeController(conn=...)`. The controller has **no** `.step(bearing_deg=..., range_m=..., dt=...)` or `.last_groups` — use the low-level loop `probe_brain.py` actually uses:
+```powershell
+# set token once
+$env:NEUPRINT_TOKEN="your_token_here"
+
+# probe live slice — default flight-relevant cell types
+python -m flybfm probe --brain neuprint --steps 250
+
+# custom slice
+python -m flybfm probe --brain neuprint --cell-types R1-R6,T4,T5,DNp26,DNp57,KC,MBON --dataset male-cns:v1.0 --steps 250
+
+# fight with live slice
+python -m flybfm fight --blue neuprint --red level --tag perch --replay web/replays/neuprint_perch.json
+
+# also works as --blue brain --brain neuprint
+python -m flybfm fight --blue brain --brain neuprint --cell-types R1-R6,T4,T5,DNp26,DNp57,KC,MBON --red level --max-time 10
+
+# train readout on live slice
+python -m flybfm train --policy brain --brain neuprint --use-torch --generations 3 --population 10 --episodes 3 --out runs/neuprint_brain
+
+# token can also come from arg
+python -m flybfm probe --brain neuprint --neuprint-token your_token_here --steps 100
+```
+
+`--cell-types` is a comma-separated list. Default if omitted is a flight-relevant set:
+`R1-R6,T4,T5,LC4,LPLC2,STMD,VPN,DNp26,DNp57,DNp03,DNg02,DNp06,DNa02,DNg13,DNp10,DNHS1,KC,MBON,PAM,PPL101`
+(visual early, descending steering, mushroom body). Token read from `--neuprint-token` or `NEUPRINT_TOKEN` env var.
+`--dataset` defaults to `male-cns:v1.0`, `--neuprint-server` to `https://neuprint.janelia.org`.
+
+### Fetch slice — also available as direct Python (in-memory, no CLI feather cache)
+
+`fetch_connectome.py` only has `list` / `download` / `prune` — **no slice-to-feather** subcommand. CLI `--brain malecns` is full-download only (expects the 3-file official naming). Don't use `FLYBFM_CONNECTOME` env var for slices — it won't work.
+
+You can also use `load_neuprint()` directly which returns an in-memory `Connectome`, and pass it to `ConnectomeController(conn=...)`. The controller has **no** `.step(bearing_deg=..., range_m=..., dt=...)` or `.last_groups` — use the low-level loop `probe_brain.py` actually uses:
 
 ```powershell
 python - << 'PY'

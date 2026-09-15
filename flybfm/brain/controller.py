@@ -281,12 +281,21 @@ def build_controller(kind: str = "connectome", seed: int = 0,
                      readout: Optional[ReadoutParams] = None,
                      use_torch: bool = False,
                      torch_device: Optional[str] = None,
+                     cell_types: Optional[Sequence[str]] = None,
+                     dataset: str = "male-cns:v1.0",
+                     token: str = "",
+                     server: str = "https://neuprint.janelia.org",
                      **kw) -> ConnectomeController:
-    """`kind`: 'connectome' (synthetic stand-in) or 'malecns' (real data).
+    """`kind`: 'connectome' (synthetic stand-in), 'malecns' (real flat files),
+    or 'neuprint' (live slice via neuPrint, Level 1 — no 1.1GB download).
 
     The `malecns` path needs the downloaded flat connectome; point
     FLYBFM_CONNECTOME / FLYBFM_ANNOTATIONS at the feather files (see
     tools/fetch_connectome.py) and it will load and prune them for real.
+
+    The `neuprint` path pulls an induced subgraph live: requires
+    NEUPRINT_TOKEN env var or token= argument and neuprint-python.
+    cell_types defaults to a flight-relevant set if not provided.
     """
     import os
     if kind == "malecns":
@@ -296,10 +305,22 @@ def build_controller(kind: str = "connectome", seed: int = 0,
             raise RuntimeError(
                 "Set FLYBFM_CONNECTOME and FLYBFM_ANNOTATIONS to the MaleCNS "
                 "feather files (see tools/fetch_connectome.py), or use "
-                "--brain synthetic."
+                "--brain synthetic or --brain neuprint."
             )
         from .connectome import load_malecns_flat
         conn = flight_subgraph(load_malecns_flat(con_path, ann_path))
+    elif kind in ("neuprint", "neuprint_slice", "slice"):
+        from .connectome import load_neuprint
+        # default flight-relevant slice if caller didn't specify
+        if not cell_types:
+            cell_types = ["R1-R6","T4","T5","LC4","LPLC2","STMD","VPN",
+                          "DNp26","DNp57","DNp03","DNg02","DNp06","DNa02","DNg13","DNp10","DNHS1",
+                          "KC","MBON","PAM","PPL101"]
+        # token from arg or env
+        tok = token or os.environ.get("NEUPRINT_TOKEN", "")
+        conn = load_neuprint(dataset=dataset, token=tok,
+                             cell_types=list(cell_types), server=server)
+        conn = flight_subgraph(conn)
     else:
         conn = flight_subgraph(synthetic_connectome(seed=seed, neurons=neurons))
     # haltere / wind afferents are not in the generic synthetic graph; add them

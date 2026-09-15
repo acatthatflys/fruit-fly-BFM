@@ -79,7 +79,8 @@ Output: scenario, result (`blue`/`red`/`draw`), JSON summary, scorecard, first e
 
 ### Viewer (Level -1 works too)
 ```powershell
-python -m flybfm serve --port 8000 --host 0.0.0.0
+python -m flybfm serve --port 8000
+# default --host 127.0.0.1 = localhost only. Use --host 0.0.0.0 to expose on LAN (no auth — anyone on WiFi can start/stop training via /api/train/start|stop).
 ```
 Open **http://localhost:8000/** in Chrome/Edge. You should see 3D fight, ground plane, WEZ bubble. If `web/replays/` empty, generate one with `--replay` above, then click ↻ in header.
 
@@ -138,7 +139,7 @@ python -m flybfm train --policy brain --use-torch --generations 3 --population 1
 
 ## Level 1 — Small neural slice via neuPrint (visual→DN, no 1.1 GB download)
 
-**What:** Pull induced subgraph live from neuPrint — only cell types you request, no volumes/skeletons. Real transmitter signs (GABA/GLUT negative), real degree distribution, hundreds-thousands KC→MBON.
+**What:** Pull induced subgraph live from neuPrint — only cell types you request, no volumes/skeletons. Real transmitter signs (GABA/GLUT negative), real degree distribution, hundreds-thousands KC→MBON. **No feather files, no env vars** — uses in-memory `Connectome`.
 
 **Cost:** 100-5k neurons, 10k-500k synapses, 50-200 MB RAM, 0.2-2 s/fight py, 0.5 ms/step torch CPU. Needs free neuPrint account + token.
 
@@ -158,27 +159,158 @@ $env:NEUPRINT_TOKEN="your_token_here"
 [Environment]::SetEnvironmentVariable("NEUPRINT_TOKEN","your_token_here","User")
 ```
 
-### Fetch slice (Python)
+### CLI — `--brain neuprint` (Level 1 wired, no feather cache)
+
+`load_neuprint()` is now wired into the CLI. No 1.1 GB download, no `FLYBFM_CONNECTOME` env var.
+
+```powershell
+# set token once
+$env:NEUPRINT_TOKEN="your_token_here"
+
+# probe live slice — default flight-relevant cell types
+python -m flybfm probe --brain neuprint --steps 250
+
+# custom slice
+python -m flybfm probe --brain neuprint --cell-types R1-R6,T4,T5,DNp26,DNp57,KC,MBON --dataset male-cns:v1.0 --steps 250
+
+# fight with live slice
+python -m flybfm fight --blue neuprint --red level --tag perch --replay web/replays/neuprint_perch.json
+
+# also works as --blue brain --brain neuprint
+python -m flybfm fight --blue brain --brain neuprint --cell-types R1-R6,T4,T5,DNp26,DNp57,KC,MBON --red level --max-time 10
+
+# train readout on live slice
+python -m flybfm train --policy brain --brain neuprint --use-torch --generations 3 --population 10 --episodes 3 --out runs/neuprint_brain
+
+# token can also come from arg
+python -m flybfm probe --brain neuprint --neuprint-token your_token_here --steps 100
+```
+
+`--cell-types` is a comma-separated list. Default if omitted is a flight-relevant set:
+`R1-R6,T4,T5,LC4,LPLC2,STMD,VPN,DNp26,DNp57,DNp03,DNg02,DNp06,DNa02,DNg13,DNp10,DNHS1,KC,MBON,PAM,PPL101`
+(visual early, descending steering, mushroom body). Token read from `--neuprint-token` or `NEUPRINT_TOKEN` env var.
+`--dataset` defaults to `male-cns:v1.0`, `--neuprint-server` to `https://neuprint.janelia.org`.
+
+### Fetch slice — also available as direct Python (in-memory, no CLI feather cache)
+
+`fetch_connectome.py` only has `list` / `download` / `prune` — **no slice-to-feather** subcommand. CLI `--brain malecns` is full-download only (expects the 3-file official naming). Don't use `FLYBFM_CONNECTOME` env var for slices — it won't work.
+
+You can also use `load_neuprint()` directly which returns an in-memory `Connectome`, and pass it to `ConnectomeController(conn=...)`. The controller has **no** `.step(bearing_deg=..., range_m=..., dt=...)` or `.last_groups` — use the low-level loop `probe_brain.py` actually uses:
+
 ```powershell
 python - << 'PY'
 from flybfm.brain.connectome import load_neuprint
+from flybfm.brain.controller import ConnectomeController
+from flybfm.sim.arena import Scenario
+from flybfm.sim.dogfight import Dogfight, EnvConfig
+
+# 1. pull slice live — no files written
 conn = load_neuprint(dataset="male-cns:v1.0",
                      cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","VPN",
                                  "DNp26","DNp57","DNp03","DNg02","DNp06","DNa02","DNg13","DNp10","DNHS1",
                                  "KC","MBON","PAM","PPL101"])
 print(conn.stats())
+# e.g. 2.1k neurons, 180k edges, 1.2k KC->MBON plastic
+
+# 2. use directly — param is conn=, not connectome=
+ctl = ConnectomeController(conn=conn, plasticity=False)
+# ctl = ConnectomeController(conn=conn, plasticity=True) for inner dopamine
+
+# 3. open-loop drive like probe_brain.py does
+env = Dogfight(EnvConfig())
+env.reset(Scenario(range_m=500.0, taa_deg=0.0, nose_offset_deg=-30.0, alt_m=6000.0, seed=0))
+me = env.blue
+other = env.red
+
+groups = ctl._groups()  # DN groups the readout looks at
+for _ in range(250):
+    ctl.net.clear_inputs()
+    ctl.sensors.inject(ctl.net, me.s, other.s, me.geom_to_other,
+                       getattr(me, "los_rate_rad", 0.0), ctl.net.p.dt)
+    ctl.net.step()
+
+rates = {k: ctl.net.group_rate(v) for k, v in groups.items()}
+print("DN rates:", rates)
+print("pop Hz:", ctl.net.population_rate())
 PY
 ```
 
-### Or via CLI tools
+Probe with torch, same low-level loop:
+
 ```powershell
-python -m flybfm.tools.fetch_connectome list
-# if you cached a slice as feather:
-$env:FLYBFM_CONNECTOME="data/malecns_pruned/connectome.feather"
-$env:FLYBFM_ANNOTATIONS="data/malecns_pruned/annotations.feather"
-python -m flybfm probe --brain malecns --use-torch --steps 100
-python -m flybfm probe --brain malecns --steps 250 --use-torch --plasticity
+python - << 'PY'
+from flybfm.brain.connectome import load_neuprint
+from flybfm.brain.controller import ConnectomeController
+from flybfm.sim.arena import Scenario
+from flybfm.sim.dogfight import Dogfight, EnvConfig
+
+conn = load_neuprint(dataset="male-cns:v1.0",
+                     cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","DNp26","DNp57","DNp03","DNg02","KC","MBON"])
+ctl = ConnectomeController(conn=conn, use_torch=True, plasticity=True)
+
+env = Dogfight(EnvConfig())
+env.reset(Scenario(range_m=300.0, taa_deg=0.0, nose_offset_deg=-10.0, alt_m=6000.0, seed=1))
+me, other = env.blue, env.red
+
+for _ in range(100):
+    ctl.net.clear_inputs()
+    ctl.sensors.inject(ctl.net, me.s, other.s, me.geom_to_other, 0.0, ctl.net.p.dt)
+    ctl.net.step()
+
+print({k: ctl.net.group_rate(v) for k, v in ctl._groups().items()})
+PY
 ```
+
+Fight example — use controller directly as policy (no CLI flag):
+
+```powershell
+python - << 'PY'
+from flybfm.brain.connectome import load_neuprint
+from flybfm.brain.controller import ConnectomeController
+from flybfm.train.policy import BrainPolicyAdapter
+from flybfm.sim.arena import CANONICAL_SETUPS
+from flybfm.sim.dogfight import run_match, EnvConfig
+import json, os
+
+conn = load_neuprint(dataset="male-cns:v1.0",
+                     cell_types=["R1-R6","T4","T5","LC4","LPLC2","STMD","DNp26","DNp57","KC","MBON"])
+ctl = ConnectomeController(conn=conn, use_torch=True)
+brain = BrainPolicyAdapter(ctl)  # wraps act() + reset() + observe_reward()
+
+sc = CANONICAL_SETUPS["perch"]
+_, _, env = run_match(sc, brain, "level", EnvConfig(max_time_s=30.0), record=True)
+os.makedirs("web/replays", exist_ok=True)
+with open("web/replays/brain_slice.json", "w") as fh:
+    json.dump(env.to_replay(), fh)
+print("wrote web/replays/brain_slice.json")
+PY
+```
+
+
+
+### Why not env-var feather?
+
+`load_malecns_flat()` derives the neurotransmitter file via string-replace `connectome-weights` → `body-neurotransmitters`, so it only works with the official 3-file naming from `download`:
+- `connectome-weights-male-cns-v1.0-minconf-0.5.feather`
+- `body-annotations-male-cns-v1.0-minconf-0.5.feather`
+- `body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather`
+
+If you write a slice as `connectome.feather` / `annotations.feather`, the replace fails and transmitter signs are missing. That's why Level 1 must stay in-memory.
+
+### Future fix — proposed `fetch-slice` subcommand
+
+Longer-term we will add:
+
+```powershell
+python -m flybfm.tools.fetch_connectome fetch-slice --cell-types R1-R6,T4,T5,LC4,DNp26,DNp57,KC,MBON --out data/slice_pruned --dataset male-cns:v1.0
+# writes:
+#   data/slice_pruned/connectome-weights-male-cns-v1.0-minconf-0.5.feather
+#   data/slice_pruned/body-annotations-male-cns-v1.0-minconf-0.5.feather
+#   data/slice_pruned/body-neurotransmitters-male-cns-v1.0-minconf-0.5.feather
+# with expected naming so load_malecns_flat() works, plus a manifest.json with query
+```
+
+Until then, use the short script above — no `FLYBFM_CONNECTOME` / `FLYBFM_ANNOTATIONS`.
 
 **When to use:** Real wiring without 1.1 GB. Recommended for Track B (connectome vs shuffled).
 
@@ -250,9 +382,10 @@ This is the new part (2026-09). `flybfm serve` now has `/api/train/*` and spawns
 ### Terminal 1 — serve
 ```powershell
 cd C:\Users\YourName\Documents\fruit-fly-BFM
-python -m flybfm serve --port 8000 --host 0.0.0.0 --runs-dir runs/live
+python -m flybfm serve --port 8000 --runs-dir runs/live
+# default binds 127.0.0.1 (localhost only). For LAN exposure use --host 0.0.0.0 (no auth on /api/train/* — anyone on network can start/stop jobs).
 # prints:
-# serving ... on http://0.0.0.0:8000/
+# serving ... on http://127.0.0.1:8000/
 #   live training API: POST .../api/train/start
 #   status: GET .../api/train/status
 #   live replay: GET .../api/train/live
@@ -333,6 +466,7 @@ Web uses it for ETA: `total_fights * avg_fight_s *0.75`.
 | pandas not found Level 1/2 | `pip install -e ".[data]"` |
 | PowerShell env vars not persisting | Use `[Environment]::SetEnvironmentVariable(...,"User")` then restart terminal |
 | Port 8000 in use | `python -m flybfm serve --port 8001` |
+| Serve exposed on LAN | Default is now `127.0.0.1` (localhost only). `--host 0.0.0.0` exposes `/api/train/start|stop` with no auth — only use on trusted LAN. |
 | Training already running | `http://localhost:8000/api/train/status` → `running pid` → ■ stop or `taskkill /PID <pid> /T /F` |
 
 ---
@@ -344,7 +478,7 @@ Web uses it for ETA: `total_fights * avg_fight_s *0.75`.
 git clone https://github.com/acatthatflys/fruit-fly-BFM.git; cd fruit-fly-BFM
 pip install -e ".[torch]"; python -m unittest discover -s tests
 python -m flybfm fight --blue guns --red level --tag perch --replay web/replays/perch.json
-python -m flybfm serve --port 8000 --host 0.0.0.0
+python -m flybfm serve --port 8000
 # open http://localhost:8000/ in browser, click ⚙ train → ▶ start training → 👁 watch live fly
 ```
 

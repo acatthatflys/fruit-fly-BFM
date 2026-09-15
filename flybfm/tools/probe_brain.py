@@ -42,7 +42,9 @@ VISUAL_TYPES = {"STMD", "T4", "T5", "T2", "T3"}
 
 def _sweep(bearings: List[float], steps: int, seed: int, distance: float,
            side: str = "blue", use_torch: bool = False, torch_device: str | None = None,
-           plasticity: bool = False, brain_kind: str = "synthetic") -> List[dict]:
+           plasticity: bool = False, brain_kind: str = "synthetic",
+           cell_types: str | None = None, dataset: str = "male-cns:v1.0",
+           neuprint_token: str | None = None, neuprint_server: str = "https://neuprint.janelia.org") -> List[dict]:
     """One row per commanded angle off the nose, measured geometry reported back."""
     rows: List[dict] = []
     for want in bearings:
@@ -53,8 +55,11 @@ def _sweep(bearings: List[float], steps: int, seed: int, distance: float,
         env = Dogfight(EnvConfig())
         env.reset(Scenario(range_m=distance, taa_deg=0.0,
                            nose_offset_deg=-want, alt_m=6000.0, seed=seed))
+        ct_list = [s.strip() for s in cell_types.split(",") if s.strip()] if cell_types else None
         ctl = build_controller(kind=brain_kind, seed=seed, use_torch=use_torch,
-                               torch_device=torch_device, plasticity=plasticity)
+                               torch_device=torch_device, plasticity=plasticity,
+                               cell_types=ct_list, dataset=dataset,
+                               token=neuprint_token or "", server=neuprint_server)
         conn = ctl.conn
         me = env.blue if side == "blue" else env.red
         other = env.red if side == "blue" else env.blue
@@ -165,10 +170,16 @@ def probe_brain(args) -> int:
     torch_device = getattr(args, "torch_device", None)
     plasticity = getattr(args, "plasticity", False)
     brain_kind = getattr(args, "brain", "synthetic")
+    cell_types = getattr(args, "cell_types", None)
+    dataset = getattr(args, "dataset", "male-cns:v1.0")
+    neuprint_token = getattr(args, "neuprint_token", None)
+    neuprint_server = getattr(args, "neuprint_server", "https://neuprint.janelia.org")
 
     rows = _sweep(list(bearings), steps, seed, distance, side,
                   use_torch=use_torch, torch_device=torch_device,
-                  plasticity=plasticity, brain_kind=brain_kind)
+                  plasticity=plasticity, brain_kind=brain_kind,
+                  cell_types=cell_types, dataset=dataset,
+                  neuprint_token=neuprint_token, neuprint_server=neuprint_server)
     print("connectome probe: %d bearings x %d steps (%.2f s of brain time each)"
           % (len(rows), steps, steps * 0.002))
     print("target %.0f m from the %s, both level, neither moving" % (distance, side))
@@ -204,10 +215,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--bearings", type=int, nargs="*", default=None,
                     help="commanded angles off the nose (right positive)")
     ap.add_argument("--out", default=None, help="write the table as JSON")
-    ap.add_argument("--brain", default="synthetic", choices=["synthetic", "malecns"], help="brain kind")
+    ap.add_argument("--brain", default="synthetic", choices=["synthetic", "malecns", "neuprint"], help="brain kind: synthetic, malecns (flat files), neuprint (Level 1 live slice)")
     ap.add_argument("--use-torch", action="store_true", help="use TorchLIFNetwork")
     ap.add_argument("--torch-device", default=None, help="torch device")
     ap.add_argument("--plasticity", action="store_true", help="enable KC->MBON plasticity")
+    ap.add_argument("--cell-types", default=None, help="comma-separated cell types for --brain neuprint")
+    ap.add_argument("--dataset", default="male-cns:v1.0", help="neuprint dataset")
+    ap.add_argument("--neuprint-token", default=None, help="neuprint token or NEUPRINT_TOKEN env")
+    ap.add_argument("--neuprint-server", default="https://neuprint.janelia.org", help="neuprint server URL")
     return probe_brain(ap.parse_args(argv))
 
 
