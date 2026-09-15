@@ -11,7 +11,7 @@
   <div class="brand">
     <span class="dot blue"></span>
     <h1>fruit-fly-BFM</h1>
-    <span class="sub">guns-only BFM, flown by a connectome-constrained controller</span>
+    <span class="sub">guns-only BFM, flown by a connectome-constrained controller · ground + skybox + 46 mountains + F-16 + realistic fly cockpit</span>
   </div>
   <div class="pickers">
     <select id="replaySel" title="replay"></select>
@@ -108,7 +108,8 @@
     <p class="foot">
       Frames are recorded at <span id="rate" class="mono">—</span>. Drag on the view
       to orbit, wheel to zoom, click the timeline to scrub.<br>
-      <span class="dim">Tip: run <span class="mono">flybfm serve</span> then <span class="mono">flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> in another terminal. Closing window doesn't kill training; viewer shows live match. Gunnery final: 22d obs lead az/el separate + tanh fine, tracking 1° w12 + 30° w2 inverse-quad grad at 100°→20°, hit 10 kill 100, good trigger +2 bad -0.01 good_solution +0.5 in_wez +0.05, points 0.05, known-good warm start. Est bench 6 fights 60s mix, 8-11 fights/s.</span>
+      <span class="dim">Graphics: ground layers (3 quads + brighter grid + center cross + arena ring) + skybox (gradient + 180 stars + moon glow + horizon glow) + 46 low-poly mountains (32 outer with snow caps + 14 inner hills, higher alpha for visibility) + F-16 Fighting Falcon (fuselage + bubble canopy + intakes + clipped delta wings + single vertical tail + afterburner with blue core) + realistic Drosophila melanogaster (red faceted eyes, antennae, halteres, transparent veined wings flapping, segmented yellow abdomen, 6 legs with front pair gripping stick, in detailed cockpit with side consoles and seat belts). If you don't see mountains, hard-refresh (Ctrl+Shift+R).<br>
+      Tip: run <span class="mono">flybfm serve</span> then <span class="mono">flybfm train --live-replay web/replays/live.json --live-status runs/live/status.json</span> in another terminal. Closing window doesn't kill training; viewer shows live match. Gunnery final: 22d obs lead az/el separate + tanh fine, tracking 1° w12 + 30° w2 inverse-quad grad at 100°→20°, hit 10 kill 100, good trigger +2 bad -0.01 good_solution +0.5 in_wez +0.05, points 0.05, known-good warm start. Est bench 6 fights 60s mix, 8-11 fights/s.</span>
     </p>
   </aside>
 </main>
@@ -140,6 +141,10 @@
   <canvas id="strip"></canvas>
 </footer>
 
-<script src="app.js"></script>
+<script src="app.js?v=20260915-graphics2"></script>
+<script>
+// cache-busting note: graphics upgrades include ground layers + skybox with stars + 40 low-poly mountains with snow caps + F-16 Fighting Falcon model + realistic Drosophila melanogaster cockpit with stick manipulation
+console.log("fruit-fly-BFM viewer v20260915-graphics2: ground+skybox+40 mountains + F-16 + realistic fly cockpit");
+</script>
 </body>
 </html>
