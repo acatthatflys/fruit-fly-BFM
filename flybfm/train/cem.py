@@ -63,11 +63,13 @@ def run_episode(scenario: Scenario, learner, opponent, env_cfg: EnvConfig,
     # brain policy must be reset each episode so episodes are independent —
     # otherwise v/i_syn/refractory/rate_ma leak from previous fight (episode
     # leakage bug). Feature/poly policies are stateless, reset is no-op.
-    if hasattr(learner, "reset"):
-        try:
-            learner.reset()
-        except Exception:
-            pass
+    # Reset both sides so self-play / frozen brain opponents don't leak either.
+    for pol in (learner, opponent):
+        if hasattr(pol, "reset"):
+            try:
+                pol.reset()
+            except Exception:
+                pass
     env = Dogfight(env_cfg, reward_cfg)
     env.reset(scenario)
     returns = 0.0
@@ -391,9 +393,8 @@ def train(policy_factory: Callable[[Sequence[float]], object],
                 info, _ = run_episode(sc, policy, rec.policy, env_cfg, rc,
                                       learn=True, record=False)
                 total += info["return"]
-                if hasattr(rec.policy, "observe_reward"):
-                    # observation now 22 dims (was 20, was 18) — gunnery-focused final
-                    rec.policy.observe_reward((0.0,) * 22, 0.0)
+                # opponent does not learn — previously called observe_reward with zeros
+                # which would corrupt a brain opponent's dopamine/eligibility trace.
                 rec.register(info["result"])
             scores.append(total / cfg.episodes_per_candidate)
 

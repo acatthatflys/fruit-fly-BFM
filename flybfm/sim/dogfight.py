@@ -514,6 +514,7 @@ def _brain_snapshot_from_policy(policy):
             if not _brain_snapshot_warned:
                 import warnings
                 warnings.warn(f"brain snapshot population_rate failed: {e}")
+                _brain_snapshot_warned = True
             pop = 0.0
         try:
             spikes = len(getattr(net, 'spikes', []))
@@ -534,6 +535,7 @@ def _brain_snapshot_from_policy(policy):
             if not _brain_snapshot_warned:
                 import warnings
                 warnings.warn(f"brain snapshot per_type failed: {e}")
+                _brain_snapshot_warned = True
 
         return {
             'groups': groups,
@@ -565,6 +567,13 @@ def run_match(scen: Scenario, policy_blue, policy_red,
     population activity are recorded into frames as `brain` and `brain_red`
     for the visualizer's brain-firing and fly stick panels.
     """
+    # Reset brain policies so episodes are independent (episode leakage fix).
+    for pol in (policy_blue, policy_red):
+        if hasattr(pol, "reset"):
+            try:
+                pol.reset()
+            except Exception:
+                pass
     env = Dogfight(cfg, rc)
     env.reset(scen)
     trace = []
