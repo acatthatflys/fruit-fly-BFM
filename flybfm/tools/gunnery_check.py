@@ -31,19 +31,49 @@ from ..sim.scripted import POOL_BY_NAME, default_pool
 from ..train.policy import FeaturePolicy, PolyPolicy
 
 
-def _load_policy(path: str, seed: int = 0):
-    """Load a policy, using whatever action basis the checkpoint was trained on."""
+def _load_policy(path: str, seed: int = 0, brain_kind: str = "synthetic", use_torch: bool = False):
+    """Load a policy, using whatever action basis the checkpoint was trained on.
+    Supports brain checkpoints as well as features/poly.
+    """
     with open(path) as fh:
         data = json.load(fh)
     if isinstance(data, dict) and "best" in data:
-        params, basis = data["best"]["params"], data.get("basis", "linear")
+        params = data["best"]["params"]
+        basis = data.get("basis", "linear")
+        # brain checkpoints have basis brain or 10 params
+        if basis == "brain" or (isinstance(params, (list, tuple)) and len(params) == 10):
+            try:
+                from ..brain.controller import build_controller, ReadoutParams
+                from ..train.policy import BrainPolicyAdapter
+                readout = ReadoutParams.from_vector(params) if params else None
+                ctl = build_controller(brain_kind, seed=seed, readout=readout, use_torch=use_torch)
+                return BrainPolicyAdapter(ctl)
+            except Exception as e:
+                print(f"brain load failed ({e}), falling back to features")
+        # meta may contain basis
+        if basis == "poly":
+            return PolyPolicy(params)
+        return FeaturePolicy(params)
     else:
-        params, basis = data, "linear"
-    return PolyPolicy(params) if basis == "poly" else FeaturePolicy(params)
+        # raw list
+        params = data if isinstance(data, (list, tuple)) else data.get("params", data)
+        basis = data.get("basis", "linear") if isinstance(data, dict) else "linear"
+        if basis == "brain" or (isinstance(params, (list, tuple)) and len(params) == 10):
+            try:
+                from ..brain.controller import build_controller, ReadoutParams
+                from ..train.policy import BrainPolicyAdapter
+                readout = ReadoutParams.from_vector(params) if params else None
+                ctl = build_controller(brain_kind, seed=seed, readout=readout, use_torch=use_torch)
+                return BrainPolicyAdapter(ctl)
+            except Exception as e:
+                print(f"brain load failed ({e})")
+        return PolyPolicy(params) if basis == "poly" else FeaturePolicy(params)
 
 
 def gunnery_check(args) -> int:
-    pol = _load_policy(args.params)
+    brain_kind = getattr(args, "brain", "synthetic")
+    use_torch = getattr(args, "use_torch", False)
+    pol = _load_policy(args.params, seed=getattr(args, "seed", 0), brain_kind=brain_kind, use_torch=use_torch)
     if args.opponent not in POOL_BY_NAME:
         print("unknown opponent %r; pool is: %s"
               % (args.opponent, ", ".join(sorted(POOL_BY_NAME))))
@@ -60,6 +90,12 @@ def gunnery_check(args) -> int:
     in_range_steps = 0
 
     for ep in range(args.episodes):
+        # Reset brain policy each episode so episodes are independent
+        if hasattr(pol, "reset"):
+            try:
+                pol.reset()
+            except Exception:
+                pass
         # A little jitter per episode, otherwise a deterministic policy against a
         # deterministic target produces the *same fight* N times and the table
         # below is one sample wearing N hats.  (Measured: it was.  Every episode
@@ -134,12 +170,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--params", default="runs/features/training.json")
     ap.add_argument("--opponent", default="level")
     ap.add_argument("--episodes", type=int, default=6)
-    ap.add_argument("--range", type=int, default=300)
+    ap.add_argument("--range", type=float, default=300.0)
     ap.add_argument("--taa", type=float, default=0.0)
     ap.add_argument("--v-a", type=float, default=280.0)
     ap.add_argument("--v-t", type=float, default=250.0)
     ap.add_argument("--max-time", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=1000)
+    ap.add_argument("--brain", default="synthetic", choices=["synthetic", "malecns", "neuprint"], help="brain kind for brain checkpoints")
+    ap.add_argument("--use-torch", action="store_true", help="use TorchLIFNetwork for brain policy")
     return gunnery_check(ap.parse_args(argv))
 
 

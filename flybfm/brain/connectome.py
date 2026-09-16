@@ -498,7 +498,7 @@ def load_malecns_flat(connectome_path: str, annotations_path: str,
                 return n
         raise KeyError(f"none of {names} in columns {list(df.columns)}")
 
-    id_col = pick(ann, "bodyId", "body_id", "body_id", "id", "bodyId_pre", "body_pre")
+    id_col = pick(ann, "bodyId", "body_id", "id", "bodyId_pre", "body_pre")
     type_col = pick(ann, "cell_type", "type", "primary_type", "cellType", "instance_type")
     # Fix annotation schema mismatch: actual dataset has somaSide, rootSide
     side_col = pick(ann, "side", "side_predicted", "somaSide", "rootSide", "soma_side", "root_side", "somaSide_predicted")
@@ -513,8 +513,8 @@ def load_malecns_flat(connectome_path: str, annotations_path: str,
         tx_col = None
         tx_id_col = None
     # Fix edge schema: actual current files use body_pre, body_post, weight
-    pre_col = pick(con, "body_pre", "bodyId_pre", "pre", "pre_bodyId", "bodyId_pre")
-    post_col = pick(con, "body_post", "bodyId_post", "post", "post_bodyId", "bodyId_post")
+    pre_col = pick(con, "body_pre", "bodyId_pre", "pre", "pre_bodyId")
+    post_col = pick(con, "body_post", "bodyId_post", "post", "post_bodyId")
     w_col = pick(con, "weight", "syn_count", "count", "synapses", "size")
 
     ids = list(ann[id_col])

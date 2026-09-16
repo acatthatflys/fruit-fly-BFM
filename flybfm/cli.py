@@ -220,7 +220,16 @@ def cmd_train(args) -> int:
     else:
         raise SystemExit("policy must be 'features' or 'brain'")
     if args.policy == "brain":
-        init = globals().get("init", None)
+        # brain policy has no known-good linear init; start from zeros unless resumed
+        init = None
+        resume_path = getattr(args, "resume", None)
+        if resume_path:
+            try:
+                ck = _load_checkpoint(resume_path)
+                init = ck["params"]
+                print(f"resuming brain from {resume_path} ({len(init)} params)")
+            except Exception as e:
+                print(f"resume failed: {e}")
 
     easy_frac = getattr(args, "easy_frac", 0.4)
     defensive_frac = getattr(args, "defensive_frac", 0.3)
